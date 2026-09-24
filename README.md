@@ -1,5 +1,7 @@
 # glock
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 后端无关的分布式锁库。核心模块定义契约，各后端独立 module 按需引用：
 
 ```bash
