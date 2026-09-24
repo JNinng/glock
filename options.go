@@ -80,7 +80,8 @@ type lockerConfig struct {
 
 func newLockerConfig(opts []Option) lockerConfig {
 	// observ 约定：构造期对默认值做一次快照，之后替换全局默认不影响本组件。
-	c := lockerConfig{log: observ.DefaultLogger(), meter: observ.DefaultMeter(), prefix: "glock:"}
+	// prefix 默认空：物理键布局（如 redisc 的 glock: 前缀）由后端自管。
+	c := lockerConfig{log: observ.DefaultLogger(), meter: observ.DefaultMeter()}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -97,8 +98,9 @@ func WithMeter(m observ.Meter) Option {
 	return func(c *lockerConfig) { c.meter = m }
 }
 
-// WithNamespace 设置 Key 命名空间前缀（默认 "glock:"），
-// 用于在同一后端实例上隔离多套锁。句柄上的 FencingTokens 仍返回未加前缀的 Key。
+// WithNamespace 设置 Key 的逻辑命名空间前缀（默认无），用于在同一后端
+// 实例上隔离多套锁。物理键布局由后端自管（如 redisc 默认前缀 glock:，
+// 效果 glock:{<key>}）。句柄上的 FencingTokens 仍返回未加前缀的 Key。
 func WithNamespace(prefix string) Option {
 	return func(c *lockerConfig) { c.prefix = prefix }
 }

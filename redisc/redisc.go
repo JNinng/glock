@@ -1,13 +1,15 @@
 // Package redisc 提供基于 Redis（go-redis v9）的 glock 后端。
 //
-// 数据布局（BasicLocker 已加命名空间前缀，此处直接使用完整 Key）：
+// 数据布局（prefix 默认 "glock:"，可用 WithKeyPrefix 调整或置空）：
 //
-//   - 锁记录：一个 Hash，Key 为 "{<key>}"（hash tag 保证与栅栏计数同 slot，
-//     兼容 Redis Cluster）。
+//   - 锁记录：一个 Hash，Key 为 "<prefix>{<key>}"（hash tag 只含业务 Key 本体，
+//     保证与栅栏计数同 slot，兼容 Redis Cluster；SCAN <prefix>:* 可枚举全部）。
 //   - 写模式字段：owner、count、mode="0"、fence、expires（绝对毫秒时间戳）。
 //   - 读模式字段：mode="1"，每个读者三件套 o:<owner>（计数）、e:<owner>（到期）、
 //     f:<owner>（栅栏）。
-//   - 栅栏计数：独立 Key "{<key>}:f" 的 INCR，永不过期（保单调）。
+//   - 栅栏计数：独立 Key "<prefix>{<key>}:f" 的 INCR，永不过期（保单调）。
+//
+// 默认布局示例：锁 glock:{job:42}，栅栏 glock:{job:42}:f。
 //
 // 所有操作走 Lua 保证原子。过期比较用客户端绝对时间：竞争者间的时钟偏差
 // 进入互斥窗口，要求运行环境 NTP 对时（Redisson 同款假设）。
@@ -23,19 +25,43 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// 默认物理键前缀：效果为 glock:{<key>} 与 glock:{<key>}:f。
+const DefaultKeyPrefix = "glock:"
+
 // New 返回基于 go-redis 的 Locker，实现 glock 全部能力接口
-// （Locker、RWLocker、MultiLocker）。client 由调用方管理生命周期。
+// （Locker、RWLocker、MultiLocker），键布局为默认前缀 glock:{<key>}。
+// client 由调用方管理生命周期；需要自定义键前缀时用 NewDriver + glock.NewBasicLocker。
 func New(client redis.UniversalClient, opts ...glock.Option) *glock.BasicLocker {
 	return glock.NewBasicLocker(NewDriver(client), opts...)
+}
+
+// DriverOption 配置 Driver 的物理键布局。
+type DriverOption func(*driverConfig)
+
+type driverConfig struct {
+	prefix string
+}
+
+// WithKeyPrefix 设置物理键前缀，默认 DefaultKeyPrefix（"glock:"），
+// 传空字符串表示无前缀（直接 {<key>}）。
+func WithKeyPrefix(prefix string) DriverOption {
+	return func(c *driverConfig) { c.prefix = prefix }
 }
 
 // Driver 是 Redis 后端的 glock.Driver 实现。
 type Driver struct {
 	client redis.UniversalClient
+	prefix string
 }
 
 // NewDriver 构造 Driver。通常直接用 New 获得完整 Locker。
-func NewDriver(client redis.UniversalClient) *Driver { return &Driver{client: client} }
+func NewDriver(client redis.UniversalClient, opts ...DriverOption) *Driver {
+	c := driverConfig{prefix: DefaultKeyPrefix}
+	for _, o := range opts {
+		o(&c)
+	}
+	return &Driver{client: client, prefix: c.prefix}
+}
 
 // 返回码约定（Lua 数组首元素）：1 成功，0 被他人持有，-1 防误删拒绝，-2 模式冲突。
 const (
@@ -199,13 +225,16 @@ end
 return -1
 `)
 
-func lockKey(key string) string  { return "{" + key + "}" }
-func fenceKey(key string) string { return "{" + key + "}:f" }
+// lockKey 返回锁记录的物理键：<prefix>{<key>}。
+func (d *Driver) lockKey(key string) string { return d.prefix + "{" + key + "}" }
+
+// fenceKey 返回栅栏计数的物理键：<prefix>{<key>}:f（与锁记录同 slot）。
+func (d *Driver) fenceKey(key string) string { return d.prefix + "{" + key + "}:f" }
 
 // TryAcquire 实现 glock.Driver。
 func (d *Driver) TryAcquire(ctx context.Context, key string, mode glock.Mode, owner string, lease time.Duration) (uint64, error) {
 	res, err := acquireScript.Run(ctx, d.client,
-		[]string{lockKey(key), fenceKey(key)},
+		[]string{d.lockKey(key), d.fenceKey(key)},
 		owner, time.Now().UnixMilli(), lease.Milliseconds(), modeArg(mode),
 	).Slice()
 	if err != nil {
@@ -217,7 +246,7 @@ func (d *Driver) TryAcquire(ctx context.Context, key string, mode glock.Mode, ow
 // Refresh 实现 glock.Driver。
 func (d *Driver) Refresh(ctx context.Context, key string, mode glock.Mode, owner string, fence uint64, lease time.Duration) error {
 	n, err := refreshScript.Run(ctx, d.client,
-		[]string{lockKey(key)},
+		[]string{d.lockKey(key)},
 		owner, fence, time.Now().UnixMilli(), lease.Milliseconds(), modeArg(mode),
 	).Int()
 	if err != nil {
@@ -229,7 +258,7 @@ func (d *Driver) Refresh(ctx context.Context, key string, mode glock.Mode, owner
 // Release 实现 glock.Driver。
 func (d *Driver) Release(ctx context.Context, key string, mode glock.Mode, owner string, fence uint64) error {
 	n, err := releaseScript.Run(ctx, d.client,
-		[]string{lockKey(key)},
+		[]string{d.lockKey(key)},
 		owner, fence, time.Now().UnixMilli(), modeArg(mode),
 	).Int()
 	if err != nil {
@@ -241,7 +270,7 @@ func (d *Driver) Release(ctx context.Context, key string, mode glock.Mode, owner
 // Downgrade 实现 glock.Driver。
 func (d *Driver) Downgrade(ctx context.Context, key, owner string, fence uint64) error {
 	n, err := downgradeScript.Run(ctx, d.client,
-		[]string{lockKey(key)},
+		[]string{d.lockKey(key)},
 		owner, fence, time.Now().UnixMilli(),
 	).Int()
 	if err != nil {
@@ -252,7 +281,7 @@ func (d *Driver) Downgrade(ctx context.Context, key, owner string, fence uint64)
 
 // Drop 删除锁记录（不删栅栏计数），仅供测试模拟后端数据消失。
 func (d *Driver) Drop(ctx context.Context, key string) error {
-	if err := d.client.Del(ctx, lockKey(key)).Err(); err != nil {
+	if err := d.client.Del(ctx, d.lockKey(key)).Err(); err != nil {
 		return fmt.Errorf("redisc: drop %q: %w", key, err)
 	}
 	return nil

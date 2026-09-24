@@ -23,6 +23,9 @@ import (
 )
 
 locker := redisc.New(goredis.NewClient(&goredis.Options{Addr: ":6379"}))
+// Redis 键布局默认 glock:{<key>} 与 glock:{<key>}:f（前缀在 hash tag 外，
+// SCAN glock:* 可枚举全部）；自定义用
+// redisc.NewDriver(rdb, redisc.WithKeyPrefix("app:")) + glock.NewBasicLocker。
 
 // watchdog 模式：默认租约 30s，后台按租约/3 自动续约，进程死亡后自然到期。
 lk, err := locker.Acquire(ctx, "job:42", glock.WithWatchdog())

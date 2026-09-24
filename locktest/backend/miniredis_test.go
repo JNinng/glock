@@ -2,6 +2,8 @@ package backend
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
@@ -37,4 +39,42 @@ type mrSaboteur struct {
 
 func (s *mrSaboteur) Drop(key string) error {
 	return s.drv.Drop(context.Background(), s.ns+key)
+}
+
+// 默认物理键布局：glock:{<key>} 与 glock:{<key>}:f（前缀在 hash tag 外）。
+func TestRedisKeyLayout(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	ctx := context.Background()
+	if _, err := redisc.New(rdb).TryAcquire(ctx, "job:1"); err != nil {
+		t.Fatal(err)
+	}
+	assertKeys(t, rdb, "glock:{job:1}*", []string{"glock:{job:1}", "glock:{job:1}:f"})
+
+	// 自定义前缀；空字符串 = 无前缀。
+	drv := redisc.NewDriver(rdb, redisc.WithKeyPrefix("app:"))
+	if _, err := glock.NewBasicLocker(drv).TryAcquire(ctx, "job:2"); err != nil {
+		t.Fatal(err)
+	}
+	assertKeys(t, rdb, "app:{job:2}*", []string{"app:{job:2}", "app:{job:2}:f"})
+
+	drv0 := redisc.NewDriver(rdb, redisc.WithKeyPrefix(""))
+	if _, err := glock.NewBasicLocker(drv0).TryAcquire(ctx, "job:3"); err != nil {
+		t.Fatal(err)
+	}
+	assertKeys(t, rdb, "{job:3}*", []string{"{job:3}", "{job:3}:f"})
+}
+
+func assertKeys(t *testing.T, rdb *goredis.Client, pattern string, want []string) {
+	t.Helper()
+	got, err := rdb.Keys(context.Background(), pattern).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("keys(%q) = %v, want %v", pattern, got, want)
+	}
 }
