@@ -11,8 +11,9 @@ type Lock struct {
 	h *hold
 }
 
-// Release 释放一次持有计数。持有已终结（重复释放、已降级转移）返回包装
-// ErrLost 的错误；锁已被他人接管返回包装 ErrNotOwner 的错误；丢失后绝不误删。
+// Release 释放一次持有计数。持有已终结（重复释放、已降级转移），或被防误删
+// 拒绝（锁已被接管、租约已过期——错误内含 ErrNotOwner），均返回包装 ErrLost
+// 的错误；任何情况下绝不误删他人的记录。
 func (l *Lock) Release(ctx context.Context) error { return l.h.release(ctx) }
 
 // Refresh 手动续一个完整租约（watchdog 开启与否都可用）。

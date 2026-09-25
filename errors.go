@@ -8,7 +8,8 @@ var (
 	// 返回同时包装 ErrHeld 与 ctx 错误的错误。
 	ErrHeld = errors.New("glock: key held by another owner")
 
-	// ErrLost 表示持有已丢失（租约到期或续期失败），本地句柄不再背书互斥。
+	// ErrLost 表示本地持有已终结——丢失（租约到期或续期失败）、已释放或
+	// 已降级转移——句柄不再背书互斥。
 	ErrLost = errors.New("glock: hold lost")
 
 	// ErrNotOwner 表示变更操作被后端拒绝：Owner Token 或栅栏代际与当前记录不符
