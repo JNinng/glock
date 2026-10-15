@@ -56,13 +56,13 @@ go locker.RunReaper(ctx, time.Minute)
 | 阻塞获取   | `Acquire / AcquireRead / AcquireAll`（ctx 结束返回包装 `ErrHeld`+ctx 错误）                                                           |
 | 固定租约   | `WithLease(d)`：到期自动释放，不续期                                                                                                   |
 | 自动续期   | `WithWatchdog()`：间隔=租约/3 ±20% 抖动；续期失败→句柄 `Lost()` 关闭、操作返回 `ErrLost`                                                         |
-| 手动续约   | `Lock.Refresh(ctx)`（两种模式均可用）                                                                                                |
+| 手动续约   | `Lock.Refresh(ctx)`（watchdog 与固定租约下均可用）                                                                                                |
 | 可重入    | 同 `WithOwner(token)` 再次获取，计数递增、栅栏不变                                                                                         |
 | WAL 恢复 | 先 `glock.NewOwnerToken()` 持久化，恢复后 `Acquire(key, WithOwner(token))`                                                          |
 | 读写锁    | `AcquireRead`；持写再取读返回 `ErrModeConflict`（读→写升级不提供）                                                                           |
 | 写降读    | `Lock.Downgrade(ctx)`（原子、栅栏不变、需写计数=1、旧句柄终结）                                                                                 |
 | 多锁     | `AcquireAll`（仅互斥、字典序防死锁、all-or-nothing 回滚）                                                                                  |
-| 观测     | 日志/指标经 [observ](https://github.com/JNinng/observ)：`observ.SetDefaultLogger/ SetDefaultMeter` 或 `glock.WithLogger/WithMeter` |
+| 观测     | 日志/指标经 [observ](https://github.com/JNinng/observ)：`observ.SetDefaultLogger/SetDefaultMeter` 或 `glock.WithLogger/WithMeter` |
 
 ## 后端实现 Driver
 
