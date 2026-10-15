@@ -58,7 +58,7 @@ func WithLease(d time.Duration) AcquireOption {
 	return func(c *acquireConfig) { c.lease = d }
 }
 
-// WithWatchdog 开启自动续期：后台按约租约/3（±20% 抖动）周期续约，进程死亡后
+// WithWatchdog 开启自动续期：后台按租约/3（±20% 抖动）周期续约，进程死亡后
 // 租约自然到期、锁自动让出。不开启则零后台活动。
 func WithWatchdog() AcquireOption {
 	return func(c *acquireConfig) { c.watchdog = true }

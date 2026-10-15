@@ -46,7 +46,7 @@ type hold struct {
 	lease   time.Duration
 	wdOn    bool   // 获取时是否要求 watchdog
 	fullKey string // 带命名空间前缀的 Key，用于后端操作
-	pubKey  string // 使用者传入的原始 Key，用于 FencingTokens
+	pubKey  string // 使用者传入的原始 Key，用于日志与 FencingTokens
 	owner   string
 	fence   uint64
 	mode    Mode
