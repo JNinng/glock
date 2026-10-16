@@ -35,12 +35,13 @@ func (l *Lock) Downgrade(ctx context.Context) (*ReadLock, error) {
 		}
 		return nil, err // ErrModeConflict 或传输错误，持有状态不变
 	}
-	// 持有转移：旧句柄终结，watchdog 停止后由新读句柄重启。
-	if h.wd != nil {
-		h.wd.stopAndWait()
-	}
+	// 持有转移：先终结旧句柄再停 watchdog——在途续约失败时 refreshAll
+	// 据此识别为终结而非丢失，避免降级路径打出虚假的 lost 告警。
 	if !h.dead.CompareAndSwap(false, true) {
 		return nil, fmt.Errorf("%w: hold already ended", ErrLost)
+	}
+	if h.wd != nil {
+		h.wd.stopAndWait()
 	}
 	h.closeLost()
 	next := &hold{

@@ -64,6 +64,11 @@ func (wd *watchdog) refreshAll(timeout time.Duration) bool {
 		if err == nil {
 			continue
 		}
+		if h.dead.Load() {
+			// 持有在续约期间被终结（释放或降级转移）：旧代际续约失败是
+			// 预期结果，不得整组标记丢失。
+			return true
+		}
 		if errors.Is(err, ErrNotOwner) {
 			// 锁已被他人接管或记录消失：整组丢失。
 			for _, h := range wd.holds {
