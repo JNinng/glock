@@ -15,7 +15,9 @@ import (
 //     既有 Token 且不递增。租约已过期的记录不算存活：接管走全新获取。
 //   - Refresh/Release/Downgrade 校验 Owner Token、Fencing Token 与模式，
 //     任一不符或租约已过期返回 ErrNotOwner，绝不改动记录（防误删）。
-//   - 所有比较以后端时间为准（单一时钟源）。
+//   - 过期比较基于单一时钟源：能用后端时间的实现必须用后端时间
+//     （如 SQL now()）；后端不可取时的实现可用客户端时间，但须在包文档
+//     中写明对部署时钟的要求（如 redisc 要求 NTP 对时）。
 type Driver interface {
 	// TryAcquire 尝试一次获取。
 	// 返回 (fence, nil) 表示成功；竞争失败返回 (0, ErrHeld)；
