@@ -14,6 +14,9 @@
 // 所有操作走 Lua 保证原子。过期比较用客户端绝对时间：竞争者间的时钟偏差
 // 进入互斥窗口，要求运行环境 NTP 对时（Redisson 同款假设）。
 // 记录 Key 额外设置 PEXPIRE = 2×租约，让无人接管的过期记录由服务端回收。
+// 读模式下该 TTL 只延长不缩短（共享记录属于全体读者，短租约读者的操作
+// 不得压短长租约读者的存活窗口），代价是读者全部离开后记录至多滞留
+// 最长租约的 2 倍才被回收。
 package redisc
 
 import (
@@ -88,7 +91,8 @@ if m == mode then
     if redis.call('HEXISTS', lock, 'o:' .. owner) == 1 and tonumber(redis.call('HGET', lock, 'e:' .. owner)) > now then
       redis.call('HINCRBY', lock, 'o:' .. owner, 1)
       redis.call('HSET', lock, 'e:' .. owner, now + lease)
-      redis.call('PEXPIRE', lock, lease * 2)
+      local ttl = redis.call('PTTL', lock)
+      if ttl < lease * 2 then redis.call('PEXPIRE', lock, lease * 2) end
       return {1, tonumber(redis.call('HGET', lock, 'f:' .. owner))}
     end
   end
@@ -149,7 +153,10 @@ else
   redis.call('HSET', lock, 'e:' .. owner, now + lease)
   redis.call('HSET', lock, 'f:' .. owner, f)
 end
-redis.call('PEXPIRE', lock, lease * 2)
+-- TTL 只延长不缩短（PTTL 对新键返回负值，必然写入）：读模式下共享记录
+-- 属于全体读者，短租约读者不得把长租约读者的存活窗口压短。
+local ttl = redis.call('PTTL', lock)
+if ttl < lease * 2 then redis.call('PEXPIRE', lock, lease * 2) end
 return {1, f}
 `)
 
@@ -168,7 +175,8 @@ if redis.call('HGET', lock, 'mode') == mode then
     if tonumber(redis.call('HGET', lock, 'f:' .. owner)) == fence
         and tonumber(redis.call('HGET', lock, 'e:' .. owner)) > now then
       redis.call('HSET', lock, 'e:' .. owner, now + lease)
-      redis.call('PEXPIRE', lock, lease * 2)
+      local ttl = redis.call('PTTL', lock)
+      if ttl < lease * 2 then redis.call('PEXPIRE', lock, lease * 2) end
       return 1
     end
   end

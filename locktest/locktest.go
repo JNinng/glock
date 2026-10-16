@@ -61,6 +61,7 @@ func RunSuite(t *testing.T, f Factory) {
 	run("Reentrancy", testReentrancy)
 	run("WALRecoveryReentrant", testWALRecovery)
 	run("ReadShared", testReadShared)
+	run("MixedLeaseReadHold", testMixedLeaseReadHold)
 	run("WriteThenReadConflict", testWriteThenReadConflict)
 	run("ReadThenWriteConflict", testReadThenWriteConflict)
 	run("Downgrade", testDowngrade)

@@ -281,6 +281,36 @@ func testDowngradeCountGuard(t *testing.T, env Env) {
 	}
 }
 
+func testMixedLeaseReadHold(t *testing.T, env Env) {
+	ctx := context.Background()
+	// 长租约读者 A 先入场；短租约读者 B 加入、续约后离开。
+	// B 的任何操作不得缩短 A 的服务端存活窗口（后端若把共享记录的
+	// TTL 重置为 2×B 的租约，A 会在本测试的等待期内被提前回收）。
+	a, err := env.RW.AcquireRead(ctx, "k", glock.WithOwner("a"), glock.WithLease(30*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := env.RW.AcquireRead(ctx, "k", glock.WithOwner("b"), glock.WithLease(200*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	// A 仍持有：写者被挡，A 可正常释放。
+	if _, err := env.Locker.TryAcquire(ctx, "k", glock.WithOwner("w")); !errors.Is(err, glock.ErrHeld) {
+		t.Fatalf("writer must stay blocked by A after B (200ms lease) left: %v", err)
+	}
+	if err := a.Release(ctx); err != nil {
+		t.Fatalf("A (30s lease) lost its hold after B left: %v", err)
+	}
+}
+
 func testMultiAllOrNothing(t *testing.T, env Env) {
 	ctx := context.Background()
 	if _, err := env.Locker.Acquire(ctx, "k2", glock.WithOwner("other"), glock.WithLease(leaseFast)); err != nil {
