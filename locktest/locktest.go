@@ -66,6 +66,7 @@ func RunSuite(t *testing.T, f Factory) {
 	run("ReadThenWriteConflict", testReadThenWriteConflict)
 	run("Downgrade", testDowngrade)
 	run("DowngradeRequiresSingleCount", testDowngradeCountGuard)
+	run("DowngradeAfterExpiry", testDowngradeAfterExpiry)
 	run("MultiAllOrNothing", testMultiAllOrNothing)
 	run("MultiSharedWatchdog", testMultiSharedWatchdog)
 	run("MultiNoCrossDeadlock", testMultiNoCrossDeadlock)

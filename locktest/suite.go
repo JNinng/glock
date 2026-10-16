@@ -311,6 +311,31 @@ func testMixedLeaseReadHold(t *testing.T, env Env) {
 	}
 }
 
+func testDowngradeAfterExpiry(t *testing.T, env Env) {
+	ctx := context.Background()
+	// 写计数 2 的持有整体过期后，降级必须按"持有已丢失"拒绝，
+	// 而不是按"计数大于 1"给出模式冲突。
+	h1, err := env.Locker.Acquire(ctx, "k", glock.WithOwner("me"), glock.WithLease(leaseFast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := env.Locker.Acquire(ctx, "k", glock.WithOwner("me"), glock.WithLease(leaseFast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(holdForDag)
+	if _, err := h2.Downgrade(ctx); !errors.Is(err, glock.ErrLost) {
+		t.Fatalf("downgrade after expiry want ErrLost, got %v", err)
+	}
+	// 记录已整体过期：新持有者可接管。
+	if _, err := env.Locker.TryAcquire(ctx, "k", glock.WithOwner("other"), glock.WithLease(leaseFast)); err != nil {
+		t.Fatalf("expired record must be takeover-able: %v", err)
+	}
+	if err := h1.Release(ctx); !errors.Is(err, glock.ErrLost) {
+		t.Fatalf("stale release want ErrLost, got %v", err)
+	}
+}
+
 func testMultiAllOrNothing(t *testing.T, env Env) {
 	ctx := context.Background()
 	if _, err := env.Locker.Acquire(ctx, "k2", glock.WithOwner("other"), glock.WithLease(leaseFast)); err != nil {

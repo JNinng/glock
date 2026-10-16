@@ -233,10 +233,12 @@ func (d *Driver) Downgrade(ctx context.Context, key, owner string, fence uint64)
 		return fail("downgrade", err)
 	}
 	if tag.RowsAffected() == 0 {
-		// 区分拒绝原因：计数>1 是模式冲突，否则是身份/代际不符或已过期。
+		// 区分拒绝原因：存活记录上计数>1 是模式冲突；身份/代际不符或
+		// 已过期都是防误删拒绝。过期行不得报模式冲突——持有已丢失。
 		var c int64
 		err := tx.QueryRow(ctx,
-			`SELECT count FROM glock_locks WHERE key = $1 AND owner = $2 AND mode = 'w' AND fence = $3`,
+			`SELECT count FROM glock_locks WHERE key = $1 AND owner = $2 AND mode = 'w' AND fence = $3
+			   AND expires_at > now()`,
 			key, owner, int64(fence)).Scan(&c)
 		if err == nil && c > 1 {
 			return fmt.Errorf("postgrec: downgrade %q: %w", key, glock.ErrModeConflict)
