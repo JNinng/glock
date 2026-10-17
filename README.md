@@ -75,8 +75,8 @@ go locker.RunReaper(ctx, time.Minute)
 ## 仓库布局
 
 独立 Go module（ADR-0001）：`.` 契约与编排（不携带数据库驱动，观测接缝为
-slog 与 otel/metric）、`redisc`、`postgrec`、`locktest`（一致性测试套件，
-依赖 testcontainers）。
+slog 与 otel API——`otel` 根包加 `otel/metric`）、`redisc`、`postgrec`、
+`locktest`（一致性测试套件，依赖 testcontainers）。
 本地开发用 go.work 串联；子 module 的 replace 指向本地路径，发布打嵌套 tag
 （如 `redisc/v1.0.0`）后移除。
 
