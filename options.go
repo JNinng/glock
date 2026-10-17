@@ -81,9 +81,9 @@ type lockerConfig struct {
 }
 
 func newLockerConfig(opts []Option) lockerConfig {
-	// 默认值在构造期确定，两侧语义不同：日志固定为静默快照（discard
-	// handler），之后 slog.SetDefault 不影响已构造组件；指标默认走 otel
-	// 全局委托——未配置即 noop（零打点），SetMeterProvider 即便发生在
+	// 默认值在构造期确定，日志与指标的语义不同：日志固定为静默快照
+	//（discard handler），之后 slog.SetDefault 不影响已构造组件；指标默认走
+	// otel 全局委托——未配置即 noop（零打点），SetMeterProvider 即便发生在
 	// 构造之后也会追溯生效。prefix 默认空：物理键布局（如 redisc 的
 	// glock: 前缀）由后端自管。
 	c := lockerConfig{log: slog.New(slog.DiscardHandler)}
