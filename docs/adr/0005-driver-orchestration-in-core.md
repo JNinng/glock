@@ -13,4 +13,4 @@ Driver 负责，编排逻辑只写一遍。
 
 - Driver 是导出的公开缝合点：实现 Driver + 通过 locktest.RunSuite 即成为一个 glock 后端。
 - Driver 的原子性边界就是后端脚本的原子性边界（Lua / 事务内 advisory 串行化）。
-- 编排在 core 侧需要日志与指标，因此 core 依赖观测契约 observ（其自身零第三方依赖，见 ADR-0001）。
+- 编排在 core 侧需要日志与指标，因此 core 依赖 slog 与 otel/metric（见 ADR-0001）。

@@ -72,14 +72,14 @@ func (wd *watchdog) refreshAll(timeout time.Duration) bool {
 		if errors.Is(err, ErrNotOwner) {
 			// 锁已被他人接管或记录消失：整组丢失。
 			for _, h := range wd.holds {
-				h.markLost(err)
+				h.markLost(context.Background(), err)
 			}
 			return true
 		}
 		// 续期失败原因未知（网络/后端故障）。按整组丢失处理：
 		// 宁可让业务提前停下，不可让持有在不知情下过期。
 		for _, h := range wd.holds {
-			h.markLost(err)
+			h.markLost(context.Background(), err)
 		}
 		return true
 	}

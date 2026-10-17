@@ -9,32 +9,46 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel/metric"
 )
 
-// metrics 是 Locker 级预创建的指标集合（observ 约定：构造期注册，热路径只打点）。
+// attrErrorType 对齐 OTel 语义约定的错误类型属性键。
+const attrErrorType = "error.type"
+
+// metrics 是 Locker 级预创建的指标集合：构造期注册仪表，热路径只打点。
+// 仪表由 otel meter 创建，即使 meter 未配置（全局 noop）或创建出错也返回
+// 可用实现，打点无需门控。
 type metrics struct {
-	acquired observ.Counter
-	held     observ.Counter
-	conflict observ.Counter
-	lost     observ.Counter
-	rejected observ.Counter
-	acqDur   observ.Histogram
-	enabled  bool
+	acquired metric.Int64Counter
+	held     metric.Int64Counter
+	conflict metric.Int64Counter
+	lost     metric.Int64Counter
+	rejected metric.Int64Counter
+	acqDur   metric.Float64Histogram
 }
 
-func newMetrics(m observ.Meter) metrics {
-	if m == nil || m == observ.NoopMeter {
-		return metrics{}
-	}
+func newMetrics(m metric.Meter) metrics {
+	// 创建失败的仪表仍是可用的 noop 实现（重复注册等异常场景），错误安全忽略。
+	acquired, _ := m.Int64Counter("glock_acquired_total",
+		metric.WithDescription("成功获取次数"), metric.WithUnit("1"))
+	held, _ := m.Int64Counter("glock_acquire_held_total",
+		metric.WithDescription("竞争失败（被他人持有）次数"), metric.WithUnit("1"))
+	conflict, _ := m.Int64Counter("glock_acquire_conflict_total",
+		metric.WithDescription("同 owner 模式冲突次数"), metric.WithUnit("1"))
+	lost, _ := m.Int64Counter("glock_lost_total",
+		metric.WithDescription("持有丢失次数"), metric.WithUnit("1"))
+	rejected, _ := m.Int64Counter("glock_release_rejected_total",
+		metric.WithDescription("防误删拒绝次数"), metric.WithUnit("1"))
+	acqDur, _ := m.Float64Histogram("glock_acquire_duration_seconds",
+		metric.WithDescription("阻塞获取耗时"), metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30))
 	return metrics{
-		acquired: m.NewCounter("glock_acquired_total", "成功获取次数"),
-		held:     m.NewCounter("glock_acquire_held_total", "竞争失败（被他人持有）次数"),
-		conflict: m.NewCounter("glock_acquire_conflict_total", "同 owner 模式冲突次数"),
-		lost:     m.NewCounter("glock_lost_total", "持有丢失次数"),
-		rejected: m.NewCounter("glock_release_rejected_total", "防误删拒绝次数"),
-		acqDur:   m.NewHistogram("glock_acquire_duration_seconds", "阻塞获取耗时", []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30}),
-		enabled:  true,
+		acquired: acquired,
+		held:     held,
+		conflict: conflict,
+		lost:     lost,
+		rejected: rejected,
+		acqDur:   acqDur,
 	}
 }
 
@@ -42,7 +56,7 @@ func newMetrics(m observ.Meter) metrics {
 type hold struct {
 	drv     Driver
 	met     *metrics
-	log     observ.Logger
+	log     *slog.Logger
 	lease   time.Duration
 	wdOn    bool   // 获取时是否要求 watchdog
 	fullKey string // 带命名空间前缀的 Key，用于后端操作
@@ -57,7 +71,7 @@ type hold struct {
 	wd       *watchdog   // 由 startWatchdog 设置；nil 表示无后台续约
 }
 
-func newHold(drv Driver, met *metrics, log observ.Logger, cfg acquireConfig, fullKey, pubKey string, mode Mode, fence uint64) *hold {
+func newHold(drv Driver, met *metrics, log *slog.Logger, cfg acquireConfig, fullKey, pubKey string, mode Mode, fence uint64) *hold {
 	return &hold{
 		drv:     drv,
 		met:     met,
@@ -88,17 +102,15 @@ func (h *hold) FencingToken() uint64 { return h.fence }
 func (h *hold) closeLost() { h.lostOnce.Do(func() { close(h.lost) }) }
 
 // markLost 标记持有丢失：关闭 Lost、记一次日志与指标。
-func (h *hold) markLost(reason error) {
+func (h *hold) markLost(ctx context.Context, reason error) {
 	h.lostOnce.Do(func() {
 		close(h.lost)
-		if h.met.enabled {
-			h.met.lost.Inc()
-		}
-		h.log.Log(context.Background(), slog.LevelWarn, "glock: hold lost",
+		h.met.lost.Add(ctx, 1)
+		h.log.WarnContext(ctx, "glock: hold lost",
 			slog.String("key", h.pubKey),
 			slog.String("mode", h.mode.String()),
 			slog.String("owner", h.owner),
-			slog.String(observ.AttrErrorType, reason.Error()))
+			slog.String(attrErrorType, reason.Error()))
 	})
 }
 
@@ -121,11 +133,11 @@ func (h *hold) refresh(ctx context.Context) error {
 	}
 	err := h.drv.Refresh(ctx, h.fullKey, h.mode, h.owner, h.fence, h.lease)
 	if errors.Is(err, ErrNotOwner) {
-		h.markLost(err)
+		h.markLost(ctx, err)
 		return fmt.Errorf("%w: %w", ErrLost, err)
 	}
 	if err != nil {
-		h.markLost(err) // 传输失败：租约状态未知，保守按丢失处理
+		h.markLost(ctx, err) // 传输失败：租约状态未知，保守按丢失处理
 		return err
 	}
 	return nil
@@ -143,16 +155,14 @@ func (h *hold) release(ctx context.Context) error {
 	err := h.drv.Release(ctx, h.fullKey, h.mode, h.owner, h.fence)
 	if err != nil {
 		if errors.Is(err, ErrNotOwner) {
-			if h.met.enabled {
-				h.met.rejected.Inc()
-			}
-			h.markLost(err)
+			h.met.rejected.Add(ctx, 1)
+			h.markLost(ctx, err)
 			return fmt.Errorf("%w: %w", ErrLost, err)
 		}
-		h.markLost(err)
+		h.markLost(ctx, err)
 		return err
 	}
-	h.log.Log(ctx, slog.LevelInfo, "glock: released",
+	h.log.InfoContext(ctx, "glock: released",
 		slog.String("key", h.pubKey), slog.String("mode", h.mode.String()), slog.String("owner", h.owner))
 	return nil
 }
@@ -162,8 +172,8 @@ func (h *hold) releaseQuiet(lease time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), lease)
 	defer cancel()
 	if err := h.release(ctx); err != nil {
-		h.log.Log(ctx, slog.LevelError, "glock: rollback release failed",
+		h.log.ErrorContext(ctx, "glock: rollback release failed",
 			slog.String("key", h.pubKey), slog.String("owner", h.owner),
-			slog.String(observ.AttrErrorType, err.Error()))
+			slog.String(attrErrorType, err.Error()))
 	}
 }

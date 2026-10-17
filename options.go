@@ -4,9 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"time"
 
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // 默认值。租约必须有界；watchdog 间隔取租约的三分之一，轮询与续期都带 ±20% 抖动。
@@ -73,28 +75,37 @@ func WithRetryInterval(d time.Duration) AcquireOption {
 type Option func(*lockerConfig)
 
 type lockerConfig struct {
-	log    observ.Logger
-	meter  observ.Meter
+	log    *slog.Logger
+	meter  metric.Meter
 	prefix string
 }
 
 func newLockerConfig(opts []Option) lockerConfig {
-	// observ 约定：构造期对默认值做一次快照，之后替换全局默认不影响本组件。
-	// prefix 默认空：物理键布局（如 redisc 的 glock: 前缀）由后端自管。
-	c := lockerConfig{log: observ.DefaultLogger(), meter: observ.DefaultMeter()}
+	// 默认值在构造期确定，两侧语义不同：日志固定为静默快照（discard
+	// handler），之后 slog.SetDefault 不影响已构造组件；指标默认走 otel
+	// 全局委托——未配置即 noop（零打点），SetMeterProvider 即便发生在
+	// 构造之后也会追溯生效。prefix 默认空：物理键布局（如 redisc 的
+	// glock: 前缀）由后端自管。
+	c := lockerConfig{log: slog.New(slog.DiscardHandler)}
 	for _, o := range opts {
 		o(&c)
+	}
+	if c.meter == nil {
+		c.meter = otel.GetMeterProvider().Meter("github.com/jninng/glock")
 	}
 	return c
 }
 
-// WithLogger 指定日志器，默认取构造时刻的 observ.DefaultLogger()。
-func WithLogger(l observ.Logger) Option {
+// WithLogger 指定日志器，默认静默；不跟随 slog.SetDefault，
+// 需全局联动时显式传 WithLogger(slog.Default())。
+func WithLogger(l *slog.Logger) Option {
 	return func(c *lockerConfig) { c.log = l }
 }
 
-// WithMeter 指定指标器，默认取构造时刻的 observ.DefaultMeter()。
-func WithMeter(m observ.Meter) Option {
+// WithMeter 指定指标器；默认（含显式传 nil）经由 otel 全局 MeterProvider，
+// 未配置即 noop，otel.SetMeterProvider 后自动接入（含构造之后的迟到配置）。
+// 需要与全局装配解耦时传入具体 provider 的 Meter。
+func WithMeter(m metric.Meter) Option {
 	return func(c *lockerConfig) { c.meter = m }
 }
 

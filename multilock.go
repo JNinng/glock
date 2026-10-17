@@ -45,7 +45,7 @@ func (m *MultiLock) Refresh(ctx context.Context) error {
 	for _, h := range m.holds {
 		if err := h.refresh(ctx); err != nil {
 			for _, other := range m.holds {
-				other.markLost(err)
+				other.markLost(ctx, err)
 			}
 			return err
 		}

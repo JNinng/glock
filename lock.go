@@ -30,7 +30,7 @@ func (l *Lock) Downgrade(ctx context.Context) (*ReadLock, error) {
 	err := h.drv.Downgrade(ctx, h.fullKey, h.owner, h.fence)
 	if err != nil {
 		if errors.Is(err, ErrNotOwner) {
-			h.markLost(err)
+			h.markLost(ctx, err)
 			return nil, fmt.Errorf("%w: %w", ErrLost, err)
 		}
 		return nil, err // ErrModeConflict 或传输错误，持有状态不变

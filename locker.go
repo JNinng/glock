@@ -7,8 +7,6 @@ import (
 	"log/slog"
 	"sort"
 	"time"
-
-	"github.com/jninng/observ"
 )
 
 // Locker 是最小核心能力：互斥锁的阻塞与非阻塞获取。
@@ -45,13 +43,14 @@ type MultiLocker interface {
 // 后端模块用它对外暴露统一的 Locker 类型。
 type BasicLocker struct {
 	drv    Driver
-	log    observ.Logger
+	log    *slog.Logger
 	met    metrics
 	prefix string
 }
 
-// NewBasicLocker 基于 Driver 构造 Locker。日志与指标默认取构造时刻的
-// observ.DefaultLogger/DefaultMeter，可用 WithLogger/WithMeter 覆盖。
+// NewBasicLocker 基于 Driver 构造 Locker。日志默认静默（discard handler），
+// 指标默认经由 otel 全局 MeterProvider（未配置即 noop，SetMeterProvider
+// 后自动接入），可用 WithLogger/WithMeter 覆盖。
 func NewBasicLocker(drv Driver, opts ...Option) *BasicLocker {
 	cfg := newLockerConfig(opts)
 	return &BasicLocker{
@@ -117,12 +116,10 @@ func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg
 	for {
 		fence, err := l.drv.TryAcquire(ctx, fullKey, mode, cfg.owner, cfg.lease)
 		if err == nil {
-			if l.met.enabled {
-				l.met.acquired.Inc()
-				l.met.acqDur.Observe(time.Since(start).Seconds())
-			}
+			l.met.acquired.Add(ctx, 1)
+			l.met.acqDur.Record(ctx, time.Since(start).Seconds())
 			h := newHold(l.drv, &l.met, l.log, cfg, fullKey, key, mode, fence)
-			l.log.Log(ctx, slog.LevelInfo, "glock: acquired",
+			l.log.InfoContext(ctx, "glock: acquired",
 				slog.String("key", key),
 				slog.String("mode", mode.String()),
 				slog.String("owner", cfg.owner),
@@ -132,22 +129,18 @@ func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg
 		}
 		if !errors.Is(err, ErrHeld) {
 			// ErrModeConflict 等不可通过等待自愈，直接失败。
-			if errors.Is(err, ErrModeConflict) && l.met.enabled {
-				l.met.conflict.Inc()
+			if errors.Is(err, ErrModeConflict) {
+				l.met.conflict.Add(ctx, 1)
 			}
 			return nil, err
 		}
 		if !blocking {
-			if l.met.enabled {
-				l.met.held.Inc()
-			}
+			l.met.held.Add(ctx, 1)
 			return nil, err
 		}
 		select {
 		case <-ctx.Done():
-			if l.met.enabled {
-				l.met.held.Inc()
-			}
+			l.met.held.Add(ctx, 1)
 			return nil, fmt.Errorf("%w: %w", ErrHeld, ctx.Err())
 		case <-time.After(jitter(cfg.retryEvery)):
 		}
