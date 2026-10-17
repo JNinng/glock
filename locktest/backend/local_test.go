@@ -15,7 +15,7 @@ import (
 )
 
 // 本机常驻服务的契约测试（区别于 testcontainers 拉起的一次性容器）。
-// 环境变量可覆盖；服务不可达时 skip。DSN/地址不需要的地方保持零配置。
+// 地址可用环境变量覆盖，缺省用本地默认值；服务不可达时 skip。
 
 func localRedisAddr() string {
 	if v := os.Getenv("GLOCK_TEST_REDIS_ADDR"); v != "" {

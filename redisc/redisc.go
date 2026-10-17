@@ -3,7 +3,7 @@
 // 数据布局（prefix 默认 "glock:"，可用 WithKeyPrefix 调整或置空）：
 //
 //   - 锁记录：一个 Hash，Key 为 "<prefix>{<key>}"（hash tag 只含业务 Key 本体，
-//     保证与栅栏计数同 slot，兼容 Redis Cluster；SCAN <prefix>:* 可枚举全部）。
+//     保证与栅栏计数同 slot，兼容 Redis Cluster；SCAN <prefix>* 可枚举全部）。
 //   - 写模式字段：owner、count、mode="0"、fence、expires（绝对毫秒时间戳）。
 //   - 读模式字段：mode="1"，每个读者三件套 o:<owner>（计数）、e:<owner>（到期）、
 //     f:<owner>（栅栏）。
