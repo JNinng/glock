@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-后端无关的分布式锁库。核心模块定义契约，各后端独立 module 按需引用：
+后端无关的分布式锁库，要求 Go 1.26.2 及以上。核心模块定义契约，各后端独立 module 按需引用：
 
 ```bash
 go get github.com/jninng/glock/redisc     # Redis 后端（go-redis v9）
@@ -82,6 +82,6 @@ slog 与 otel API——`otel` 根包加 `otel/metric`）、`redisc`、`postgrec`
 
 真实后端的契约测试：`locktest/backend` 优先用本机常驻服务
 （`GLOCK_TEST_REDIS_ADDR`，默认 127.0.0.1:6379；
-`GLOCK_TEST_PG_DSN`，默认 postgres://postgresql:root@127.0.0.1:5432/postgres），
+`GLOCK_TEST_PG_DSN`，默认 postgres://postgresql:root@127.0.0.1:5432/postgres?sslmode=disable），
 其次 testcontainers 拉起容器；两者都不可用时自动 skip。
 无 Docker 环境另有 miniredis（内嵌 Redis 含 Lua）套件兜底。

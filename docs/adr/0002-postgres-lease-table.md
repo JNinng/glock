@@ -1,6 +1,6 @@
 # postgrec 采用租约表而非 advisory lock
 
-Postgres 后端用一张租约表（key、owner token、mode、count、fencing、expires_at）加 CAS 更新实现锁，而不是 pg_advisory_lock。
+Postgres 后端用一张租约表（key、owner、mode、count、fence、expires_at）加 CAS 更新实现锁，而不是 pg_advisory_lock。
 
 advisory lock 只能满足需求的一半：会话级自动释放和阻塞获取天然支持，但没有租约、无法自动续期、没有 Owner Token
 概念（防误删无从谈起）、读写降级非原子，且与 PgBouncer transaction 池化不兼容。租约表虽要处理过期行清理且吞吐低于
