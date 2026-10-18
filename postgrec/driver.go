@@ -251,6 +251,37 @@ func (d *Driver) Downgrade(ctx context.Context, key, owner string, fence uint64)
 	return nil
 }
 
+// Probe 实现 glock.ProbingDriver：只读 SELECT，不改动任何行，剩余租约用
+// 数据库 now() 计算（与存活判定同源）。过期残余不算持有，清理仍属获取路径。
+func (d *Driver) Probe(ctx context.Context, key string) ([]glock.HoldInfo, error) {
+	if err := d.ensureSchema(ctx); err != nil {
+		return nil, fmt.Errorf("postgrec: probe %q: %w", key, err)
+	}
+	rows, err := d.pool.Query(ctx,
+		`SELECT owner, mode, fence, (EXTRACT(EPOCH FROM expires_at - now()) * 1000)::bigint
+		 FROM glock_locks WHERE key = $1 AND expires_at > now()
+		 ORDER BY owner`, key)
+	if err != nil {
+		return nil, fmt.Errorf("postgrec: probe %q: %w", key, err)
+	}
+	defer rows.Close()
+	var out []glock.HoldInfo
+	for rows.Next() {
+		var owner, mode string
+		var fence, ttlMs int64
+		if err := rows.Scan(&owner, &mode, &fence, &ttlMs); err != nil {
+			return nil, fmt.Errorf("postgrec: probe %q: %w", key, err)
+		}
+		out = append(out, glock.HoldInfo{
+			Owner:     owner,
+			Mode:      modeFromChar(mode),
+			Fence:     uint64(fence),
+			Remaining: time.Duration(ttlMs) * time.Millisecond,
+		})
+	}
+	return out, rows.Err()
+}
+
 // Drop 删除 Key 的全部行，仅供测试模拟后端数据消失。
 func (d *Driver) Drop(ctx context.Context, key string) error {
 	if _, err := d.pool.Exec(ctx, `DELETE FROM glock_locks WHERE key = $1`, key); err != nil {
@@ -305,6 +336,13 @@ func modeChar(mode glock.Mode) string {
 		return "r"
 	}
 	return "w"
+}
+
+func modeFromChar(s string) glock.Mode {
+	if s == "r" {
+		return glock.Read
+	}
+	return glock.Write
 }
 
 func leaseSecs(d time.Duration) float64 { return float64(d.Microseconds()) / 1e6 }

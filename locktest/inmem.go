@@ -3,6 +3,7 @@ package locktest
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -191,4 +192,33 @@ func (d *InmemDriver) Drop(_ context.Context, key string) error {
 	defer d.mu.Unlock()
 	delete(d.recs, key)
 	return nil
+}
+
+// Probe 实现 glock.ProbingDriver：只读快照，不做惰性清理（清理属获取路径）。
+func (d *InmemDriver) Probe(_ context.Context, key string) ([]glock.HoldInfo, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	r := d.recs[key]
+	if r == nil {
+		return nil, nil
+	}
+	if r.mode == glock.Write {
+		if r.writer != nil && r.writer.expires.After(now) {
+			return []glock.HoldInfo{{Owner: r.owner, Mode: glock.Write, Fence: r.writer.fence, Remaining: r.writer.expires.Sub(now)}}, nil
+		}
+		return nil, nil
+	}
+	owners := make([]string, 0, len(r.readers))
+	for o := range r.readers {
+		owners = append(owners, o)
+	}
+	sort.Strings(owners)
+	var out []glock.HoldInfo
+	for _, o := range owners {
+		if h := r.readers[o]; h.expires.After(now) {
+			out = append(out, glock.HoldInfo{Owner: o, Mode: glock.Read, Fence: h.fence, Remaining: h.expires.Sub(now)})
+		}
+	}
+	return out, nil
 }

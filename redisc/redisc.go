@@ -22,6 +22,7 @@ package redisc
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	glock "github.com/jninng/glock"
@@ -233,6 +234,43 @@ end
 return -1
 `)
 
+// Probe 只读内省：绝不改动记录（脚本无 DEL/HDEL/HSET/PEXPIRE）。只列存活
+// 持有（expires > now），剩余租约按记录内的绝对到期时间与客户端 now 之差
+// 计算，与获取/续约的存活判定同源；服务端 PEXPIRE 的回收残余（已过期未
+// 删除）不算持有。读者按 Owner 字典序输出，全部字段转字符串统一解析。
+var probeScript = redis.NewScript(`
+local lock = KEYS[1]
+local now = tonumber(ARGV[1])
+local m = redis.call('HGET', lock, 'mode')
+if not m then return {} end
+local out = {}
+if m == '0' then
+  local expires = tonumber(redis.call('HGET', lock, 'expires'))
+  if expires and expires > now then
+    table.insert(out, {redis.call('HGET', lock, 'owner'), m,
+      redis.call('HGET', lock, 'fence'), tostring(expires - now)})
+  end
+  return out
+end
+local readers = {}
+local fields = redis.call('HGETALL', lock)
+for i = 1, #fields, 2 do
+  local f = fields[i]
+  if string.sub(f, 1, 2) == 'e:' then
+    local o = string.sub(f, 3)
+    local expires = tonumber(fields[i + 1])
+    if expires > now then
+      readers[#readers + 1] = {o, expires, redis.call('HGET', lock, 'f:' .. o)}
+    end
+  end
+end
+table.sort(readers, function(a, b) return a[1] < b[1] end)
+for i = 1, #readers do
+  table.insert(out, {readers[i][1], m, readers[i][3], tostring(readers[i][2] - now)})
+end
+return out
+`)
+
 // lockKey 返回锁记录的物理键：<prefix>{<key>}。
 func (d *Driver) lockKey(key string) string { return d.prefix + "{" + key + "}" }
 
@@ -287,6 +325,40 @@ func (d *Driver) Downgrade(ctx context.Context, key, owner string, fence uint64)
 	return intResult(key, n)
 }
 
+// Probe 实现 glock.ProbingDriver：只读，不改动任何记录。
+func (d *Driver) Probe(ctx context.Context, key string) ([]glock.HoldInfo, error) {
+	res, err := probeScript.Run(ctx, d.client,
+		[]string{d.lockKey(key)},
+		time.Now().UnixMilli(),
+	).Slice()
+	if err != nil {
+		return nil, fmt.Errorf("redisc: probe %q: %w", key, err)
+	}
+	out := make([]glock.HoldInfo, 0, len(res))
+	for i, item := range res {
+		row, ok := item.([]interface{})
+		if !ok || len(row) != 4 {
+			return nil, fmt.Errorf("redisc: probe %q: unexpected reply at %d: %v", key, i, item)
+		}
+		owner, _ := row[0].(string)
+		modeS, _ := row[1].(string)
+		fenceS, _ := row[2].(string)
+		ttlS, _ := row[3].(string)
+		fence, fenceErr := strconv.ParseUint(fenceS, 10, 64)
+		ttlMs, ttlErr := strconv.ParseInt(ttlS, 10, 64)
+		if owner == "" || fenceErr != nil || ttlErr != nil {
+			return nil, fmt.Errorf("redisc: probe %q: bad row %v", key, row)
+		}
+		out = append(out, glock.HoldInfo{
+			Owner:     owner,
+			Mode:      modeFromArg(modeS),
+			Fence:     fence,
+			Remaining: time.Duration(ttlMs) * time.Millisecond,
+		})
+	}
+	return out, nil
+}
+
 // Drop 删除锁记录（不删栅栏计数），仅供测试模拟后端数据消失。
 func (d *Driver) Drop(ctx context.Context, key string) error {
 	if err := d.client.Del(ctx, d.lockKey(key)).Err(); err != nil {
@@ -300,6 +372,13 @@ func modeArg(mode glock.Mode) string {
 		return "1"
 	}
 	return "0"
+}
+
+func modeFromArg(s string) glock.Mode {
+	if s == "1" {
+		return glock.Read
+	}
+	return glock.Write
 }
 
 // acquireResult 解析 {code} 或 {code, fence}。

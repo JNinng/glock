@@ -3,6 +3,7 @@ package glock
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -187,6 +188,35 @@ func (d *fakeDriver) drop(key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.recs, key)
+}
+
+// Probe 实现 glock.ProbingDriver：只读快照，不做惰性清理（清理属获取路径）。
+func (d *fakeDriver) Probe(_ context.Context, key string) ([]HoldInfo, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	r := d.recs[key]
+	if r == nil {
+		return nil, nil
+	}
+	if r.mode == Write {
+		if r.writer != nil && r.writer.expires.After(now) {
+			return []HoldInfo{{Owner: r.owner, Mode: Write, Fence: r.writer.fence, Remaining: r.writer.expires.Sub(now)}}, nil
+		}
+		return nil, nil
+	}
+	owners := make([]string, 0, len(r.readers))
+	for o := range r.readers {
+		owners = append(owners, o)
+	}
+	sort.Strings(owners)
+	var out []HoldInfo
+	for _, o := range owners {
+		if h := r.readers[o]; h.expires.After(now) {
+			out = append(out, HoldInfo{Owner: o, Mode: Read, Fence: h.fence, Remaining: h.expires.Sub(now)})
+		}
+	}
+	return out, nil
 }
 
 // holdsKey 报告 key 当前是否有存活记录（测试断言用）。

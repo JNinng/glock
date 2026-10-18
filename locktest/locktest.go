@@ -8,6 +8,7 @@
 //	    return locktest.Env{
 //	        Locker: locker, RW: locker, Multi: locker,
 //	        Saboteur: mySaboteur{ns: ns}, // Drop 模拟后端数据消失
+//	        Prober: locker, // 可选：Driver 实现 glock.ProbingDriver 时填入
 //	    }
 //	})
 package locktest
@@ -32,6 +33,9 @@ type Env struct {
 	RW       glock.RWLocker    // v1 契约必填
 	Multi    glock.MultiLocker // v1 契约必填
 	Saboteur Saboteur          // v1 契约必填
+	// Prober 承载状态内省能力（可选）：Driver 实现 glock.ProbingDriver 时
+	// 填入；未填时 Probe 契约测试跳过。
+	Prober glock.ProbingLocker
 }
 
 // Factory 为每个子测试构造隔离环境（ns 为该子测试唯一的命名空间）。
@@ -71,4 +75,5 @@ func RunSuite(t *testing.T, f Factory) {
 	run("MultiSharedWatchdog", testMultiSharedWatchdog)
 	run("MultiNoCrossDeadlock", testMultiNoCrossDeadlock)
 	run("WatchdogLostSingle", testWatchdogLostSingle)
+	run("Probe", testProbe)
 }

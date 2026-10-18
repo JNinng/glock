@@ -36,3 +36,20 @@ type Driver interface {
 	// 校验失败返回 ErrNotOwner。
 	Downgrade(ctx context.Context, key, owner string, fence uint64) error
 }
+
+// ProbingDriver 是 Driver 的可选扩展：只读状态内省。实现绝不改动任何记录、
+// 绝不影响租约（多次调用与零次调用等价），失败也不改变持有状态。
+// BasicLocker 经类型断言探测此接口，对外透出 ProbingLocker 能力。
+type ProbingDriver interface {
+	// Probe 返回 Key 当前全部存活持有，按 Owner 排序；记录不存在或全部
+	// 租约已过期时返回空列表而非错误。过期残余的清理仍属获取路径，Probe 不做。
+	Probe(ctx context.Context, key string) ([]HoldInfo, error)
+}
+
+// HoldInfo 是 Probe 观测到的一份存活持有快照。
+type HoldInfo struct {
+	Owner     string        // Owner Token（持有者身份）
+	Mode      Mode          // 读或写
+	Fence     uint64        // 当前 Fencing Token
+	Remaining time.Duration // 剩余租约，恒为正（只报存活持有）
+}

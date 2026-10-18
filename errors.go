@@ -19,4 +19,8 @@ var (
 	// ErrModeConflict 表示同 Owner 在同一 Key 上的模式冲突：持写再取读、
 	// 持读再取写，或写计数大于 1 时降级。
 	ErrModeConflict = errors.New("glock: mode conflict")
+
+	// ErrUnsupported 表示 Driver 未实现被调用的可选能力（如状态内省）。
+	// v1 核心契约（Locker/RWLocker/MultiLocker）不涉及此错误。
+	ErrUnsupported = errors.New("glock: capability not supported by this driver")
 )

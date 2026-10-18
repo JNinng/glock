@@ -28,6 +28,7 @@ func TestMiniredisConformance(t *testing.T) {
 			RW:       locker,
 			Multi:    locker,
 			Saboteur: &mrSaboteur{drv: drv, ns: ns},
+			Prober:   locker,
 		}
 	})
 }

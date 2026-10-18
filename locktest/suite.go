@@ -447,3 +447,95 @@ func testWatchdogLostSingle(t *testing.T, env Env) {
 		t.Fatalf("lock must be free after loss: %v", err)
 	}
 }
+
+func testProbe(t *testing.T, env Env) {
+	if env.Prober == nil {
+		t.Skip("Env 未提供 Prober：Driver 未实现 glock.ProbingDriver")
+	}
+	ctx := context.Background()
+	p := env.Prober
+
+	// 无持有：空列表而非错误。
+	if got, err := p.Probe(ctx, "pk"); err != nil || len(got) != 0 {
+		t.Fatalf("probe fresh key = %v, %v; want empty list", got, err)
+	}
+
+	// 写持有：owner/mode/fence 逐项对上，剩余租约为正。
+	h, err := env.Locker.TryAcquire(ctx, "pk", glock.WithOwner("me"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.Probe(ctx, "pk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("probe write hold = %+v; want exactly one entry", got)
+	}
+	if info := got[0]; info.Owner != "me" || info.Mode != glock.Write ||
+		info.Fence != h.FencingToken() || info.Remaining <= 0 {
+		t.Fatalf("bad hold info %+v (want owner me, write, fence %d, positive remaining)",
+			info, h.FencingToken())
+	}
+
+	// 只读：反复 Probe 不影响互斥，也不给持有续期。
+	for i := 0; i < 3; i++ {
+		if _, err := p.Probe(ctx, "pk"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := env.Locker.TryAcquire(ctx, "pk", glock.WithOwner("other"), glock.WithLease(leaseLong)); !errors.Is(err, glock.ErrHeld) {
+		t.Fatalf("probe must not disturb mutual exclusion: %v", err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.Probe(ctx, "pk"); err != nil || len(got) != 0 {
+		t.Fatalf("probe after release = %v, %v; want empty list", got, err)
+	}
+
+	// 读持有：多读者全部列出，按 Owner 排序。
+	hr1, err := env.RW.AcquireRead(ctx, "pk", glock.WithOwner("r2"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hr1.Release(ctx)
+	hr2, err := env.RW.AcquireRead(ctx, "pk", glock.WithOwner("r1"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hr2.Release(ctx)
+	got, err = p.Probe(ctx, "pk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Owner != "r1" || got[1].Owner != "r2" ||
+		got[0].Mode != glock.Read || got[1].Mode != glock.Read ||
+		got[0].Remaining <= 0 || got[1].Remaining <= 0 {
+		t.Fatalf("probe read holds = %+v; want [r1 r2] both read with positive remaining", got)
+	}
+
+	// 过期即消失：短租约到期（无人释放）后不再列出。
+	he, err := env.Locker.Acquire(ctx, "px", glock.WithOwner("me"), glock.WithLease(leaseFast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Probe(ctx, "px"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(holdForDag)
+	got, err = p.Probe(ctx, "px")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("probe after expiry = %+v; want empty list (expired holds are not live)", got)
+	}
+	// 上面 Probe 过的租约确实到期了：Probe 没有替它续期。
+	if _, err := env.Locker.TryAcquire(ctx, "px", glock.WithOwner("other"), glock.WithLease(leaseFast)); err != nil {
+		t.Fatalf("probe must not extend lease: %v", err)
+	}
+	if err := he.Release(ctx); !errors.Is(err, glock.ErrLost) {
+		t.Fatalf("stale release after expiry want ErrLost, got %v", err)
+	}
+}
