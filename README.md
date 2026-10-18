@@ -81,7 +81,9 @@ go locker.RunReaper(ctx, time.Minute)
 
 独立 Go module（ADR-0001）：`.` 契约与编排（不携带数据库驱动，观测接缝为
 slog 与 otel API——`otel` 根包加 `otel/metric`）、`redisc`、`postgrec`、
-`locktest`（一致性测试套件，依赖 testcontainers）。
+`locktest`（一致性测试套件，依赖 testcontainers）、`example`（黑盒能力
+自检：只走公开 API，对可达的本机后端逐项验证全部能力，
+仓库根目录 `go run github.com/jninng/glock/example`，任一失败退出码 1）。
 本地开发用 go.work 串联；子 module 的 replace 指向本地路径，发布打嵌套 tag
 （如 `redisc/v1.0.0`）后移除。
 
