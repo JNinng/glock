@@ -56,6 +56,7 @@ go locker.RunReaper(ctx, time.Minute)
 | 阻塞获取   | `Acquire / AcquireRead / AcquireAll`（ctx 结束返回包装 `ErrHeld`+ctx 错误）                                                           |
 | 固定租约   | `WithLease(d)`：到期自动释放，不续期                                                                                                   |
 | 自动续期   | `WithWatchdog()`：间隔=租约/3 ±20% 抖动；续期失败→句柄 `Lost()` 关闭、操作返回 `ErrLost`                                                         |
+| Locker 级默认 | `WithDefaultLease / WithDefaultWatchdog`：构造级默认，单次获取可用 `WithLease / WithWatchdog` 覆盖                                                    |
 | 手动续约   | `Lock.Refresh(ctx)`（watchdog 与固定租约下均可用）                                                                                                |
 | 可重入    | 同 `WithOwner(token)` 再次获取，计数递增、栅栏不变                                                                                         |
 | WAL 恢复 | 先 `glock.NewOwnerToken()` 持久化，恢复后 `Acquire(key, WithOwner(token))`                                                          |

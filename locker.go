@@ -46,18 +46,24 @@ type BasicLocker struct {
 	log    *slog.Logger
 	met    metrics
 	prefix string
+
+	defLease    time.Duration // Locker 级默认租约
+	defWatchdog bool          // Locker 级默认 watchdog
 }
 
 // NewBasicLocker 基于 Driver 构造 Locker。日志默认静默（discard handler），
 // 指标默认经由 otel 全局 MeterProvider（未配置即 noop，SetMeterProvider
-// 后自动接入），可用 WithLogger/WithMeter 覆盖。
+// 后自动接入），租约默认 DefaultLease、无后台续期，可用 WithLogger/
+// WithMeter/WithDefaultLease/WithDefaultWatchdog 覆盖。
 func NewBasicLocker(drv Driver, opts ...Option) *BasicLocker {
 	cfg := newLockerConfig(opts)
 	return &BasicLocker{
-		drv:    drv,
-		log:    cfg.log,
-		met:    newMetrics(cfg.meter),
-		prefix: cfg.prefix,
+		drv:         drv,
+		log:         cfg.log,
+		met:         newMetrics(cfg.meter),
+		prefix:      cfg.prefix,
+		defLease:    cfg.defaultLease,
+		defWatchdog: cfg.defaultWatchdog,
 	}
 }
 
@@ -95,7 +101,7 @@ func (l *BasicLocker) AcquireRead(ctx context.Context, key string, opts ...Acqui
 
 // tryAcquire 是单 Key 获取主循环（含重试），成功后按配置启动单锁 watchdog。
 func (l *BasicLocker) tryAcquire(ctx context.Context, key string, mode Mode, opts []AcquireOption, blocking bool) (*hold, error) {
-	cfg, err := newAcquireConfig(opts)
+	cfg, err := l.newAcquireConfig(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +165,7 @@ func (l *BasicLocker) acquireAll(ctx context.Context, keys []string, opts []Acqu
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("glock: AcquireAll requires at least one key")
 	}
-	cfg, err := newAcquireConfig(opts)
+	cfg, err := l.newAcquireConfig(opts)
 	if err != nil {
 		return nil, err
 	}
