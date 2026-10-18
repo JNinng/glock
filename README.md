@@ -53,7 +53,7 @@ go locker.RunReaper(ctx, time.Minute)
 | 需求     | API                                                                                                                         |
 |--------|-----------------------------------------------------------------------------------------------------------------------------|
 | 非阻塞获取  | `TryAcquire / TryAcquireRead / TryAcquireAll`（竞争失败返回 `ErrHeld`）                                                             |
-| 阻塞获取   | `Acquire / AcquireRead / AcquireAll`（ctx 结束返回包装 `ErrHeld`+ctx 错误）                                                           |
+| 阻塞获取   | `Acquire / AcquireRead / AcquireAll`（ctx 结束返回包装 `ErrHeld`+ctx 错误）；Driver 实现 `NotifyingDriver` 时释放信号优先唤醒，轮询间隔为等待上限与兜底 |
 | 固定租约   | `WithLease(d)`：到期自动释放，不续期                                                                                                   |
 | 自动续期   | `WithWatchdog()`：间隔=租约/3 ±20% 抖动；续期失败→句柄 `Lost()` 关闭、操作返回 `ErrLost`                                                         |
 | Locker 级默认 | `WithDefaultLease / WithDefaultWatchdog`：构造级默认，单次获取可用 `WithLease / WithWatchdog` 覆盖                                                    |
@@ -71,7 +71,8 @@ go locker.RunReaper(ctx, time.Minute)
 
 后端只需实现 `glock.Driver`（单次原子操作），用 `glock.NewBasicLocker(drv)`
 获得全部编排（重试、watchdog、多锁回滚、句柄生命周期）。可选实现
-`glock.ProbingDriver`（只读内省）为 Locker 增加 `Probe` 能力。参考实现：
+`glock.ProbingDriver`（只读内省）与 `glock.NotifyingDriver`（释放唤醒）
+分别为 Locker 增加 `Probe` 与信号唤醒能力。参考实现：
 [locktest.InmemDriver](locktest/inmem.go)。新后端须通过 `locktest.RunSuite`
 全部契约测试（Docker 环境下 Redis/Postgres 后端也会跑同一套，
 见 [locktest/backend](locktest/backend)）。

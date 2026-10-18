@@ -15,8 +15,10 @@ type Locker interface {
 	// TryAcquire 非阻塞获取：一次尝试，竞争失败立即返回 ErrHeld。
 	TryAcquire(ctx context.Context, key string, opts ...AcquireOption) (*Lock, error)
 
-	// Acquire 阻塞获取：轮询直到成功或 ctx 结束。ctx 结束仍未获得时返回
+	// Acquire 阻塞获取：直到成功或 ctx 结束。ctx 结束仍未获得时返回
 	// 同时包装 ErrHeld 与 ctx 错误的错误。不保证公平与获得顺序。
+	// Driver 实现 NotifyingDriver 时由释放信号唤醒，否则按间隔轮询；
+	// 轮询间隔（WithRetryInterval）是任一实现的等待时长上限。
 	Acquire(ctx context.Context, key string, opts ...AcquireOption) (*Lock, error)
 }
 
@@ -118,6 +120,7 @@ func (l *BasicLocker) tryAcquire(ctx context.Context, key string, mode Mode, opt
 // acquireOne 执行单 Key 获取循环，不启动 watchdog（多锁路径由整组统一启动）。
 func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg acquireConfig, blocking bool) (*hold, error) {
 	fullKey := l.prefix + key
+	nd, wake := l.drv.(NotifyingDriver)
 	start := time.Now()
 	for {
 		fence, err := l.drv.TryAcquire(ctx, fullKey, mode, cfg.owner, cfg.lease)
@@ -143,6 +146,17 @@ func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg
 		if !blocking {
 			l.met.held.Add(ctx, 1)
 			return nil, err
+		}
+		// 释放唤醒（NotifyingDriver 可选）：信号优先，轮询兜底。信号是尽力
+		// 而为的——漏收、多收、虚假唤醒都无害，任何返回后都重走 TryAcquire。
+		if wake {
+			if werr := nd.WaitForChange(ctx, fullKey, jitter(cfg.retryEvery)); werr == nil {
+				continue
+			} else if ctx.Err() != nil {
+				l.met.held.Add(ctx, 1)
+				return nil, fmt.Errorf("%w: %w", ErrHeld, ctx.Err())
+			}
+			// 契约外错误（不该发生）：落到下方纯轮询等待，保住节律与活性。
 		}
 		select {
 		case <-ctx.Done():

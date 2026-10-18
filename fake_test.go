@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,9 @@ type fakeDriver struct {
 	recs    map[string]*fakeRec
 	counter uint64
 	refresh int // Refresh 成功次数
+
+	changed map[string]chan struct{} // 每键唤醒广播：变更时关闭并重置
+	waiting atomic.Int64             // 正在 WaitForChange 中停靠的等待者数（测试用）
 }
 
 type fakeRec struct {
@@ -30,7 +34,9 @@ type fakeHoldRec struct {
 	expires time.Time
 }
 
-func newFakeDriver() *fakeDriver { return &fakeDriver{recs: map[string]*fakeRec{}} }
+func newFakeDriver() *fakeDriver {
+	return &fakeDriver{recs: map[string]*fakeRec{}, changed: map[string]chan struct{}{}}
+}
 
 func (d *fakeDriver) live(r *fakeRec, now time.Time) bool {
 	if r == nil {
@@ -157,9 +163,11 @@ func (d *fakeDriver) Release(_ context.Context, key string, mode Mode, owner str
 			delete(r.readers, owner)
 			if len(r.readers) == 0 {
 				delete(d.recs, key)
+				d.broadcast(key)
 			}
 		} else {
 			delete(d.recs, key)
+			d.broadcast(key)
 		}
 	}
 	return nil
@@ -180,7 +188,41 @@ func (d *fakeDriver) Downgrade(_ context.Context, key, owner string, fence uint6
 	r.owner = ""
 	r.readers = map[string]*fakeHoldRec{owner: {count: 1, fence: r.writer.fence, expires: r.writer.expires}}
 	r.writer = nil
+	d.broadcast(key) // 写降读放行读者
 	return nil
+}
+
+// broadcast 关闭 key 的唤醒通道（须持 d.mu 调用）：所有停靠的等待者立即
+// 返回，后续等待者拿新通道。对齐真实后端：只在记录删除（释放归零）与
+// 降级时广播，TryAcquire/Refresh 不广播。
+func (d *fakeDriver) broadcast(key string) {
+	if ch, ok := d.changed[key]; ok {
+		close(ch)
+		delete(d.changed, key)
+	}
+}
+
+// WaitForChange 实现 glock.NotifyingDriver。
+func (d *fakeDriver) WaitForChange(ctx context.Context, key string, maxWait time.Duration) error {
+	d.mu.Lock()
+	ch, ok := d.changed[key]
+	if !ok {
+		ch = make(chan struct{})
+		d.changed[key] = ch
+	}
+	d.mu.Unlock()
+	d.waiting.Add(1)
+	defer d.waiting.Add(-1)
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	case <-ch:
+		return nil
+	}
 }
 
 // drop 删除记录，模拟后端数据消失（watchdog 丢失路径）。
@@ -188,6 +230,7 @@ func (d *fakeDriver) drop(key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.recs, key)
+	d.broadcast(key)
 }
 
 // Probe 实现 glock.ProbingDriver：只读快照，不做惰性清理（清理属获取路径）。

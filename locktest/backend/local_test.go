@@ -50,6 +50,7 @@ func TestLocalRedisConformance(t *testing.T) {
 			Multi:    locker,
 			Saboteur: &redisSaboteur{drv: drv, ns: ns},
 			Prober:   locker,
+			Notifier: drv,
 		}
 	})
 }
@@ -78,6 +79,7 @@ func TestLocalPostgresConformance(t *testing.T) {
 			Multi:    l,
 			Saboteur: &pgSaboteur{drv: drv, ns: ns},
 			Prober:   l,
+			Notifier: drv,
 		}
 	})
 }

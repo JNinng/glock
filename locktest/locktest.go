@@ -36,6 +36,9 @@ type Env struct {
 	// Prober 承载状态内省能力（可选）：Driver 实现 glock.ProbingDriver 时
 	// 填入；未填时 Probe 契约测试跳过。
 	Prober glock.ProbingLocker
+	// Notifier 承载释放唤醒能力（可选）：Driver 实现 glock.NotifyingDriver
+	// 时填入；未填时唤醒契约测试跳过。
+	Notifier glock.NotifyingDriver
 }
 
 // Factory 为每个子测试构造隔离环境（ns 为该子测试唯一的命名空间）。
@@ -76,4 +79,5 @@ func RunSuite(t *testing.T, f Factory) {
 	run("MultiNoCrossDeadlock", testMultiNoCrossDeadlock)
 	run("WatchdogLostSingle", testWatchdogLostSingle)
 	run("Probe", testProbe)
+	run("NotifyRelease", testNotifyRelease)
 }

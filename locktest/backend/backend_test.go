@@ -43,6 +43,7 @@ func TestRedisConformance(t *testing.T) {
 			Multi:    locker,
 			Saboteur: &redisSaboteur{drv: drv, ns: ns},
 			Prober:   locker,
+			Notifier: drv,
 		}
 	})
 }
@@ -93,6 +94,7 @@ func TestPostgresConformance(t *testing.T) {
 			Multi:    l,
 			Saboteur: &pgSaboteur{drv: drv, ns: ns},
 			Prober:   l,
+			Notifier: drv,
 		}
 	})
 }

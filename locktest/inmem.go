@@ -16,6 +16,8 @@ type InmemDriver struct {
 	mu      sync.Mutex
 	recs    map[string]*inmemRec
 	counter uint64
+
+	changed map[string]chan struct{} // 每键唤醒广播：变更时关闭并重置
 }
 
 type inmemRec struct {
@@ -32,7 +34,39 @@ type inmemHold struct {
 }
 
 // NewInmemDriver 构造内存 Driver。
-func NewInmemDriver() *InmemDriver { return &InmemDriver{recs: map[string]*inmemRec{}} }
+func NewInmemDriver() *InmemDriver {
+	return &InmemDriver{recs: map[string]*inmemRec{}, changed: map[string]chan struct{}{}}
+}
+
+// broadcast 关闭 key 的唤醒通道（须持 d.mu 调用）。对齐真实后端：只在
+// 记录删除（释放归零）与降级时广播，TryAcquire/Refresh 不广播。
+func (d *InmemDriver) broadcast(key string) {
+	if ch, ok := d.changed[key]; ok {
+		close(ch)
+		delete(d.changed, key)
+	}
+}
+
+// WaitForChange 实现 glock.NotifyingDriver。
+func (d *InmemDriver) WaitForChange(ctx context.Context, key string, maxWait time.Duration) error {
+	d.mu.Lock()
+	ch, ok := d.changed[key]
+	if !ok {
+		ch = make(chan struct{})
+		d.changed[key] = ch
+	}
+	d.mu.Unlock()
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	case <-ch:
+		return nil
+	}
+}
 
 func (d *InmemDriver) live(r *inmemRec, now time.Time) bool {
 	if r == nil {
@@ -159,9 +193,11 @@ func (d *InmemDriver) Release(_ context.Context, key string, mode glock.Mode, ow
 			delete(r.readers, owner)
 			if len(r.readers) == 0 {
 				delete(d.recs, key)
+				d.broadcast(key)
 			}
 		} else {
 			delete(d.recs, key)
+			d.broadcast(key)
 		}
 	}
 	return nil
@@ -183,6 +219,7 @@ func (d *InmemDriver) Downgrade(_ context.Context, key, owner string, fence uint
 	r.owner = ""
 	r.readers = map[string]*inmemHold{owner: {count: 1, fence: r.writer.fence, expires: r.writer.expires}}
 	r.writer = nil
+	d.broadcast(key) // 写降读放行读者
 	return nil
 }
 
@@ -191,6 +228,7 @@ func (d *InmemDriver) Drop(_ context.Context, key string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.recs, key)
+	d.broadcast(key)
 	return nil
 }
 

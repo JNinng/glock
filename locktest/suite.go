@@ -539,3 +539,54 @@ func testProbe(t *testing.T, env Env) {
 		t.Fatalf("stale release after expiry want ErrLost, got %v", err)
 	}
 }
+
+func testNotifyRelease(t *testing.T, env Env) {
+	if env.Notifier == nil {
+		t.Skip("Env 未提供 Notifier：Driver 未实现 glock.NotifyingDriver")
+	}
+	ctx := context.Background()
+
+	// 释放信号唤醒：轮询间隔 10s——纯轮询不可能在时限内醒来，通过即证明
+	// 靠信号。唤醒后重走 TryAcquire 的语义也被覆盖（信号不直接授予锁）。
+	h0, err := env.Locker.TryAcquire(ctx, "nk", glock.WithOwner("holder"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired := make(chan struct{})
+	go func() {
+		h, err := env.Locker.Acquire(ctx, "nk", glock.WithOwner("waiter"), glock.WithRetryInterval(10*time.Second))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		close(acquired)
+		if err := h.Release(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	// 留足订阅时窗再释放：信号是尽力而为的，漏收会退化为 10s 轮询导致超时。
+	time.Sleep(250 * time.Millisecond)
+	if err := h0.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking acquire did not wake on release (poll interval 10s)")
+	}
+
+	// ctx 结束必须立即穿透等待预算，不等满轮询间隔。
+	if _, err := env.Locker.TryAcquire(ctx, "nc", glock.WithOwner("holder"), glock.WithLease(leaseLong)); err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = env.Locker.Acquire(ctx2, "nc", glock.WithOwner("waiter"), glock.WithRetryInterval(10*time.Second))
+	if !errors.Is(err, glock.ErrHeld) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want ErrHeld+DeadlineExceeded, got %v", err)
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("ctx done must return promptly, took %s", time.Since(start))
+	}
+}
