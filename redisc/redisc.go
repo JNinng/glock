@@ -8,8 +8,12 @@
 //   - 读模式字段：mode="1"，每个读者三件套 o:<owner>（计数）、e:<owner>（到期）、
 //     f:<owner>（栅栏）。
 //   - 栅栏计数：独立 Key "<prefix>{<key>}:f" 的 INCR，永不过期（保单调）。
+//   - 释放唤醒通道：<prefix>{<key>}:n。释放使记录删除、或写降读时由 Go 侧
+//     PUBLISH "release"；WaitForChange 订阅该通道供阻塞获取提前醒来。不用
+//     keyspace notifications：它需要服务端 CONFIG SET（默认关闭且影响整个
+//     实例）；发布是尽力而为的，订阅生效前的释放会漏收，轮询间隔是等待上限。
 //
-// 默认布局示例：锁 glock:{job:42}，栅栏 glock:{job:42}:f。
+// 默认布局示例：锁 glock:{job:42}，栅栏 glock:{job:42}:f，唤醒通道 glock:{job:42}:n。
 //
 // 所有操作走 Lua 保证原子。过期比较用客户端绝对时间：竞争者间的时钟偏差
 // 进入互斥窗口，要求运行环境 NTP 对时（Redisson 同款假设）。
@@ -22,6 +26,7 @@ package redisc
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	glock "github.com/jninng/glock"
@@ -66,9 +71,11 @@ func NewDriver(client redis.UniversalClient, opts ...DriverOption) *Driver {
 	return &Driver{client: client, prefix: c.prefix}
 }
 
-// 返回码约定（Lua 数组首元素）：1 成功，0 被他人持有，-1 防误删拒绝，-2 模式冲突。
+// 返回码约定（Lua 数组首元素）：1 成功，2 成功且记录已删除（用于发布唤醒
+// 信号），0 被他人持有，-1 防误删拒绝，-2 模式冲突。
 const (
 	retOK       = 1
+	retReleased = 2
 	retHeld     = 0
 	retNotOwner = -1
 	retConflict = -2
@@ -192,7 +199,7 @@ if redis.call('HGET', lock, 'mode') == mode then
     if redis.call('HGET', lock, 'owner') == owner and tonumber(redis.call('HGET', lock, 'fence')) == fence
         and tonumber(redis.call('HGET', lock, 'expires')) > now then
       local c = redis.call('HINCRBY', lock, 'count', -1)
-      if c <= 0 then redis.call('DEL', lock) end
+      if c <= 0 then redis.call('DEL', lock); return 2 end
       return 1
     end
   else
@@ -206,7 +213,7 @@ if redis.call('HGET', lock, 'mode') == mode then
         for i = 1, #fields do
           if string.sub(fields[i], 1, 2) == 'o:' then readers = readers + 1 end
         end
-        if readers == 0 then redis.call('DEL', lock) end
+        if readers == 0 then redis.call('DEL', lock); return 2 end
       end
       return 1
     end
@@ -233,11 +240,52 @@ end
 return -1
 `)
 
+// Probe 只读内省：绝不改动记录（脚本无 DEL/HDEL/HSET/PEXPIRE）。只列存活
+// 持有（expires > now），剩余租约按记录内的绝对到期时间与客户端 now 之差
+// 计算，与获取/续约的存活判定同源；服务端 PEXPIRE 的回收残余（已过期未
+// 删除）不算持有。读者按 Owner 字典序输出，全部字段转字符串统一解析。
+var probeScript = redis.NewScript(`
+local lock = KEYS[1]
+local now = tonumber(ARGV[1])
+local m = redis.call('HGET', lock, 'mode')
+if not m then return {} end
+local out = {}
+if m == '0' then
+  local expires = tonumber(redis.call('HGET', lock, 'expires'))
+  if expires and expires > now then
+    table.insert(out, {redis.call('HGET', lock, 'owner'), m,
+      redis.call('HGET', lock, 'fence'), tostring(expires - now)})
+  end
+  return out
+end
+local readers = {}
+local fields = redis.call('HGETALL', lock)
+for i = 1, #fields, 2 do
+  local f = fields[i]
+  if string.sub(f, 1, 2) == 'e:' then
+    local o = string.sub(f, 3)
+    local expires = tonumber(fields[i + 1])
+    if expires > now then
+      readers[#readers + 1] = {o, expires, redis.call('HGET', lock, 'f:' .. o)}
+    end
+  end
+end
+table.sort(readers, function(a, b) return a[1] < b[1] end)
+for i = 1, #readers do
+  table.insert(out, {readers[i][1], m, readers[i][3], tostring(readers[i][2] - now)})
+end
+return out
+`)
+
 // lockKey 返回锁记录的物理键：<prefix>{<key>}。
 func (d *Driver) lockKey(key string) string { return d.prefix + "{" + key + "}" }
 
 // fenceKey 返回栅栏计数的物理键：<prefix>{<key>}:f（与锁记录同 slot）。
 func (d *Driver) fenceKey(key string) string { return d.prefix + "{" + key + "}:f" }
+
+// notifyKey 返回释放唤醒的发布通道：<prefix>{<key>}:n（与锁记录同 slot，
+// Cluster 下订阅经由同 slot 路由）。
+func (d *Driver) notifyKey(key string) string { return d.prefix + "{" + key + "}:n" }
 
 // TryAcquire 实现 glock.Driver。
 func (d *Driver) TryAcquire(ctx context.Context, key string, mode glock.Mode, owner string, lease time.Duration) (uint64, error) {
@@ -272,6 +320,10 @@ func (d *Driver) Release(ctx context.Context, key string, mode glock.Mode, owner
 	if err != nil {
 		return fmt.Errorf("redisc: release %q: %w", key, err)
 	}
+	if n == retReleased {
+		// 释放唤醒信号：尽力而为，发布失败不影响释放语义。
+		_ = d.client.Publish(ctx, d.notifyKey(key), "release").Err()
+	}
 	return intResult(key, n)
 }
 
@@ -284,7 +336,81 @@ func (d *Driver) Downgrade(ctx context.Context, key, owner string, fence uint64)
 	if err != nil {
 		return fmt.Errorf("redisc: downgrade %q: %w", key, err)
 	}
+	if n == retOK {
+		// 写降读放行读者：发布唤醒信号（尽力而为）。
+		_ = d.client.Publish(ctx, d.notifyKey(key), "release").Err()
+	}
 	return intResult(key, n)
+}
+
+// Probe 实现 glock.ProbingDriver：只读，不改动任何记录。
+func (d *Driver) Probe(ctx context.Context, key string) ([]glock.HoldInfo, error) {
+	res, err := probeScript.Run(ctx, d.client,
+		[]string{d.lockKey(key)},
+		time.Now().UnixMilli(),
+	).Slice()
+	if err != nil {
+		return nil, fmt.Errorf("redisc: probe %q: %w", key, err)
+	}
+	out := make([]glock.HoldInfo, 0, len(res))
+	for i, item := range res {
+		row, ok := item.([]interface{})
+		if !ok || len(row) != 4 {
+			return nil, fmt.Errorf("redisc: probe %q: unexpected reply at %d: %v", key, i, item)
+		}
+		owner, _ := row[0].(string)
+		modeS, _ := row[1].(string)
+		fenceS, _ := row[2].(string)
+		ttlS, _ := row[3].(string)
+		fence, fenceErr := strconv.ParseUint(fenceS, 10, 64)
+		ttlMs, ttlErr := strconv.ParseInt(ttlS, 10, 64)
+		if owner == "" || fenceErr != nil || ttlErr != nil {
+			return nil, fmt.Errorf("redisc: probe %q: bad row %v", key, row)
+		}
+		out = append(out, glock.HoldInfo{
+			Owner:     owner,
+			Mode:      modeFromArg(modeS),
+			Fence:     fence,
+			Remaining: time.Duration(ttlMs) * time.Millisecond,
+		})
+	}
+	return out, nil
+}
+
+// WaitForChange 实现 glock.NotifyingDriver：订阅本 Key 的释放通道，至多
+// 阻塞 maxWait。发布是尽力而为的——订阅生效前发生的释放会漏收，等待落回
+// maxWait 由调用方轮询兜底。传输故障按剩余预算等满（契约禁止非 ctx 错误）。
+func (d *Driver) WaitForChange(ctx context.Context, key string, maxWait time.Duration) error {
+	deadline := time.Now().Add(maxWait)
+	ps := d.client.Subscribe(ctx, d.notifyKey(key))
+	defer ps.Close()
+	for {
+		wctx, cancel := context.WithDeadline(ctx, deadline)
+		msg, err := ps.Receive(wctx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return waitOut(ctx, deadline)
+		}
+		switch msg.(type) {
+		case *redis.Subscription: // 订阅确认，继续等消息
+		case *redis.Message:
+			return nil
+		}
+	}
+}
+
+// waitOut 按剩余预算阻塞至 deadline：通知机制故障时的兜底等待，保住调用方
+// 的轮询节律。
+func waitOut(ctx context.Context, deadline time.Time) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Until(deadline)):
+		return nil
+	}
 }
 
 // Drop 删除锁记录（不删栅栏计数），仅供测试模拟后端数据消失。
@@ -300,6 +426,13 @@ func modeArg(mode glock.Mode) string {
 		return "1"
 	}
 	return "0"
+}
+
+func modeFromArg(s string) glock.Mode {
+	if s == "1" {
+		return glock.Read
+	}
+	return glock.Write
 }
 
 // acquireResult 解析 {code} 或 {code, fence}。
@@ -333,7 +466,7 @@ func acquireResult(key string, res []interface{}) (uint64, error) {
 // intResult 解析单整数返回码（refresh/release/downgrade 共用）。
 func intResult(key string, code int) error {
 	switch code {
-	case retOK:
+	case retOK, retReleased:
 		return nil
 	case retNotOwner:
 		return fmt.Errorf("redisc: %w", glock.ErrNotOwner)

@@ -30,8 +30,9 @@ type acquireConfig struct {
 	retryEvery time.Duration
 }
 
-func newAcquireConfig(opts []AcquireOption) (acquireConfig, error) {
-	c := acquireConfig{lease: DefaultLease, retryEvery: DefaultRetryInterval}
+// newAcquireConfig 以 Locker 级默认值打底，再应用单次获取选项。
+func (l *BasicLocker) newAcquireConfig(opts []AcquireOption) (acquireConfig, error) {
+	c := acquireConfig{lease: l.defLease, watchdog: l.defWatchdog, retryEvery: DefaultRetryInterval}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -75,9 +76,11 @@ func WithRetryInterval(d time.Duration) AcquireOption {
 type Option func(*lockerConfig)
 
 type lockerConfig struct {
-	log    *slog.Logger
-	meter  metric.Meter
-	prefix string
+	log             *slog.Logger
+	meter           metric.Meter
+	prefix          string
+	defaultLease    time.Duration
+	defaultWatchdog bool
 }
 
 func newLockerConfig(opts []Option) lockerConfig {
@@ -85,8 +88,8 @@ func newLockerConfig(opts []Option) lockerConfig {
 	//（discard handler），之后 slog.SetDefault 不影响已构造组件；指标默认走
 	// otel 全局委托——未配置即 noop（零打点），SetMeterProvider 即便发生在
 	// 构造之后也会追溯生效。prefix 默认空：物理键布局（如 redisc 的
-	// glock: 前缀）由后端自管。
-	c := lockerConfig{log: slog.New(slog.DiscardHandler)}
+	// glock: 前缀）由后端自管。租约默认 DefaultLease、无后台续期。
+	c := lockerConfig{log: slog.New(slog.DiscardHandler), defaultLease: DefaultLease}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -114,6 +117,18 @@ func WithMeter(m metric.Meter) Option {
 // 效果 glock:{<key>}）。句柄上的 FencingTokens 仍返回未加前缀的 Key。
 func WithNamespace(prefix string) Option {
 	return func(c *lockerConfig) { c.prefix = prefix }
+}
+
+// WithDefaultLease 设置 Locker 级默认租约（默认 DefaultLease=30s）：单次
+// 获取未传 WithLease 时生效。取值合法性随每次 Acquire 校验，时机同 WithLease。
+func WithDefaultLease(d time.Duration) Option {
+	return func(c *lockerConfig) { c.defaultLease = d }
+}
+
+// WithDefaultWatchdog 让本 Locker 的全部获取默认开启自动续期：单次获取
+// 仍可显式 WithWatchdog（等价）；逐次关闭不支持，需要混合模式时另建 Locker。
+func WithDefaultWatchdog() Option {
+	return func(c *lockerConfig) { c.defaultWatchdog = true }
 }
 
 // NewOwnerToken 生成全局唯一的 Owner Token。

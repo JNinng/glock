@@ -18,6 +18,8 @@ func TestInmemConformance(t *testing.T) {
 			RW:       locker,
 			Multi:    locker,
 			Saboteur: &inmemSaboteur{drv: drv, ns: ns},
+			Prober:   locker,
+			Notifier: drv,
 		}
 	})
 }

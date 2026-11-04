@@ -36,3 +36,32 @@ type Driver interface {
 	// 校验失败返回 ErrNotOwner。
 	Downgrade(ctx context.Context, key, owner string, fence uint64) error
 }
+
+// ProbingDriver 是 Driver 的可选扩展：只读状态内省。实现绝不改动任何记录、
+// 绝不影响租约（多次调用与零次调用等价），失败也不改变持有状态。
+// BasicLocker 经类型断言探测此接口，对外透出 ProbingLocker 能力。
+type ProbingDriver interface {
+	// Probe 返回 Key 当前全部存活持有，按 Owner 排序；记录不存在或全部
+	// 租约已过期时返回空列表而非错误。过期残余的清理仍属获取路径，Probe 不做。
+	Probe(ctx context.Context, key string) ([]HoldInfo, error)
+}
+
+// HoldInfo 是 Probe 观测到的一份存活持有快照。
+type HoldInfo struct {
+	Owner     string        // Owner Token（持有者身份）
+	Mode      Mode          // 读或写
+	Fence     uint64        // 当前 Fencing Token
+	Remaining time.Duration // 剩余租约，恒为正（只报存活持有）
+}
+
+// NotifyingDriver 是 Driver 的可选扩展：让阻塞获取在 Key 状态变化时被
+// 唤醒，而不是纯轮询。信号是尽力而为的加速器：漏收（订阅生效前发生）、
+// 重复、虚假唤醒都允许——BasicLocker 在任何返回后都会重走 TryAcquire，
+// 轮询间隔（WithRetryInterval）是等待时长的上限。实现不得因通知机制故障
+// 而以非 ctx 错误返回：故障时按剩余预算等满即可，保住轮询节律。
+type NotifyingDriver interface {
+	// WaitForChange 至多阻塞 maxWait：观测到 key 的相关变化（释放、过期、
+	// 降级等，可能虚假）即提前返回 nil；maxWait 用尽返回 nil；ctx 结束
+	// 返回 ctx 错误。
+	WaitForChange(ctx context.Context, key string, maxWait time.Duration) error
+}

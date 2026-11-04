@@ -33,7 +33,35 @@ CREATE TABLE IF NOT EXISTS glock_locks (
   PRIMARY KEY (key, owner)
 );
 CREATE INDEX IF NOT EXISTS glock_locks_expires_idx ON glock_locks (expires_at);
+CREATE OR REPLACE FUNCTION glock_notify_change() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' OR (TG_OP = 'UPDATE' AND OLD.mode = 'w' AND NEW.mode = 'r') THEN
+    PERFORM pg_notify('glock_change', OLD.key);
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'glock_locks_notify'
+      AND tgrelid = 'glock_locks'::regclass AND NOT tgisinternal
+  ) THEN
+    BEGIN
+      -- CREATE TRIGGER 取表级排他锁：只在缺失时执行，避免与并发的锁操作
+      -- 事务（advisory + 行锁）互相等待。并发冷启动撞车按已创建处理。
+      CREATE TRIGGER glock_locks_notify
+      AFTER DELETE OR UPDATE ON glock_locks
+      FOR EACH ROW EXECUTE FUNCTION glock_notify_change();
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+  END IF;
+END $$;
 `
+
+// notifyChannel 是释放唤醒的 LISTEN/NOTIFY 通道，payload 为记录的 key。
+const notifyChannel = "glock_change"
 
 // EnsureSchema 幂等建表。首个锁操作前会自动尝试（成功一次后跳过）；
 // 显式调用可预热并提前暴露权限问题。
@@ -251,6 +279,80 @@ func (d *Driver) Downgrade(ctx context.Context, key, owner string, fence uint64)
 	return nil
 }
 
+// Probe 实现 glock.ProbingDriver：只读 SELECT，不改动任何行，剩余租约用
+// 数据库 now() 计算（与存活判定同源）。过期残余不算持有，清理仍属获取路径。
+func (d *Driver) Probe(ctx context.Context, key string) ([]glock.HoldInfo, error) {
+	if err := d.ensureSchema(ctx); err != nil {
+		return nil, fmt.Errorf("postgrec: probe %q: %w", key, err)
+	}
+	rows, err := d.pool.Query(ctx,
+		`SELECT owner, mode, fence, (EXTRACT(EPOCH FROM expires_at - now()) * 1000)::bigint
+		 FROM glock_locks WHERE key = $1 AND expires_at > now()
+		 ORDER BY owner`, key)
+	if err != nil {
+		return nil, fmt.Errorf("postgrec: probe %q: %w", key, err)
+	}
+	defer rows.Close()
+	var out []glock.HoldInfo
+	for rows.Next() {
+		var owner, mode string
+		var fence, ttlMs int64
+		if err := rows.Scan(&owner, &mode, &fence, &ttlMs); err != nil {
+			return nil, fmt.Errorf("postgrec: probe %q: %w", key, err)
+		}
+		out = append(out, glock.HoldInfo{
+			Owner:     owner,
+			Mode:      modeFromChar(mode),
+			Fence:     uint64(fence),
+			Remaining: time.Duration(ttlMs) * time.Millisecond,
+		})
+	}
+	return out, rows.Err()
+}
+
+// WaitForChange 实现 glock.NotifyingDriver：独立连接 LISTEN，收到本 Key
+// 的通知即提前返回。通知由 glock_locks 上的触发器在行删除（释放、过期
+// 清理）与写降读时发出，随事务提交送达——信号与状态可见性有序。尽力而为：
+// LISTEN 生效前发生的通知会漏收，等待落回 maxWait 由调用方轮询兜底；
+// 拿不到连接或 LISTEN 失败（如 PgBouncer 事务池化）按剩余预算等满。
+func (d *Driver) WaitForChange(ctx context.Context, key string, maxWait time.Duration) error {
+	deadline := time.Now().Add(maxWait)
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return waitOut(ctx, deadline)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `LISTEN `+notifyChannel); err != nil {
+		return waitOut(ctx, deadline)
+	}
+	for {
+		wctx, cancel := context.WithDeadline(ctx, deadline)
+		n, err := conn.Conn().WaitForNotification(wctx)
+		cancel()
+		if err == nil {
+			if n.Channel == notifyChannel && n.Payload == key {
+				return nil
+			}
+			continue // 其他 Key 的通知：继续等自己的
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return waitOut(ctx, deadline) // maxWait 用尽或连接故障：等满剩余预算
+	}
+}
+
+// waitOut 按剩余预算阻塞至 deadline：通知机制故障时的兜底等待，保住调用方
+// 的轮询节律。
+func waitOut(ctx context.Context, deadline time.Time) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Until(deadline)):
+		return nil
+	}
+}
+
 // Drop 删除 Key 的全部行，仅供测试模拟后端数据消失。
 func (d *Driver) Drop(ctx context.Context, key string) error {
 	if _, err := d.pool.Exec(ctx, `DELETE FROM glock_locks WHERE key = $1`, key); err != nil {
@@ -305,6 +407,13 @@ func modeChar(mode glock.Mode) string {
 		return "r"
 	}
 	return "w"
+}
+
+func modeFromChar(s string) glock.Mode {
+	if s == "r" {
+		return glock.Read
+	}
+	return glock.Write
 }
 
 func leaseSecs(d time.Duration) float64 { return float64(d.Microseconds()) / 1e6 }

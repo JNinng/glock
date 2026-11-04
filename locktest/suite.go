@@ -447,3 +447,146 @@ func testWatchdogLostSingle(t *testing.T, env Env) {
 		t.Fatalf("lock must be free after loss: %v", err)
 	}
 }
+
+func testProbe(t *testing.T, env Env) {
+	if env.Prober == nil {
+		t.Skip("Env 未提供 Prober：Driver 未实现 glock.ProbingDriver")
+	}
+	ctx := context.Background()
+	p := env.Prober
+
+	// 无持有：空列表而非错误。
+	if got, err := p.Probe(ctx, "pk"); err != nil || len(got) != 0 {
+		t.Fatalf("probe fresh key = %v, %v; want empty list", got, err)
+	}
+
+	// 写持有：owner/mode/fence 逐项对上，剩余租约为正。
+	h, err := env.Locker.TryAcquire(ctx, "pk", glock.WithOwner("me"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.Probe(ctx, "pk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("probe write hold = %+v; want exactly one entry", got)
+	}
+	if info := got[0]; info.Owner != "me" || info.Mode != glock.Write ||
+		info.Fence != h.FencingToken() || info.Remaining <= 0 {
+		t.Fatalf("bad hold info %+v (want owner me, write, fence %d, positive remaining)",
+			info, h.FencingToken())
+	}
+
+	// 只读：反复 Probe 不影响互斥，也不给持有续期。
+	for i := 0; i < 3; i++ {
+		if _, err := p.Probe(ctx, "pk"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := env.Locker.TryAcquire(ctx, "pk", glock.WithOwner("other"), glock.WithLease(leaseLong)); !errors.Is(err, glock.ErrHeld) {
+		t.Fatalf("probe must not disturb mutual exclusion: %v", err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.Probe(ctx, "pk"); err != nil || len(got) != 0 {
+		t.Fatalf("probe after release = %v, %v; want empty list", got, err)
+	}
+
+	// 读持有：多读者全部列出，按 Owner 排序。
+	hr1, err := env.RW.AcquireRead(ctx, "pk", glock.WithOwner("r2"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hr1.Release(ctx)
+	hr2, err := env.RW.AcquireRead(ctx, "pk", glock.WithOwner("r1"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hr2.Release(ctx)
+	got, err = p.Probe(ctx, "pk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Owner != "r1" || got[1].Owner != "r2" ||
+		got[0].Mode != glock.Read || got[1].Mode != glock.Read ||
+		got[0].Remaining <= 0 || got[1].Remaining <= 0 {
+		t.Fatalf("probe read holds = %+v; want [r1 r2] both read with positive remaining", got)
+	}
+
+	// 过期即消失：短租约到期（无人释放）后不再列出。
+	he, err := env.Locker.Acquire(ctx, "px", glock.WithOwner("me"), glock.WithLease(leaseFast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Probe(ctx, "px"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(holdForDag)
+	got, err = p.Probe(ctx, "px")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("probe after expiry = %+v; want empty list (expired holds are not live)", got)
+	}
+	// 上面 Probe 过的租约确实到期了：Probe 没有替它续期。
+	if _, err := env.Locker.TryAcquire(ctx, "px", glock.WithOwner("other"), glock.WithLease(leaseFast)); err != nil {
+		t.Fatalf("probe must not extend lease: %v", err)
+	}
+	if err := he.Release(ctx); !errors.Is(err, glock.ErrLost) {
+		t.Fatalf("stale release after expiry want ErrLost, got %v", err)
+	}
+}
+
+func testNotifyRelease(t *testing.T, env Env) {
+	if env.Notifier == nil {
+		t.Skip("Env 未提供 Notifier：Driver 未实现 glock.NotifyingDriver")
+	}
+	ctx := context.Background()
+
+	// 释放信号唤醒：轮询间隔 10s——纯轮询不可能在时限内醒来，通过即证明
+	// 靠信号。唤醒后重走 TryAcquire 的语义也被覆盖（信号不直接授予锁）。
+	h0, err := env.Locker.TryAcquire(ctx, "nk", glock.WithOwner("holder"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired := make(chan struct{})
+	go func() {
+		h, err := env.Locker.Acquire(ctx, "nk", glock.WithOwner("waiter"), glock.WithRetryInterval(10*time.Second))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		close(acquired)
+		if err := h.Release(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	// 留足订阅时窗再释放：信号是尽力而为的，漏收会退化为 10s 轮询导致超时。
+	time.Sleep(250 * time.Millisecond)
+	if err := h0.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking acquire did not wake on release (poll interval 10s)")
+	}
+
+	// ctx 结束必须立即穿透等待预算，不等满轮询间隔。
+	if _, err := env.Locker.TryAcquire(ctx, "nc", glock.WithOwner("holder"), glock.WithLease(leaseLong)); err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = env.Locker.Acquire(ctx2, "nc", glock.WithOwner("waiter"), glock.WithRetryInterval(10*time.Second))
+	if !errors.Is(err, glock.ErrHeld) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want ErrHeld+DeadlineExceeded, got %v", err)
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("ctx done must return promptly, took %s", time.Since(start))
+	}
+}
