@@ -3,6 +3,8 @@ package locktest
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +18,36 @@ const (
 	leaseLong  = 30 * time.Second
 	holdForDag = 400 * time.Millisecond
 )
+
+// 全新 Locker 被多 goroutine 同时首次使用：初始化（建表、预编译、建连）的
+// 并发不得使任何调用失败。各取互不相干的 Key，排除竞争失败。
+func testColdStartConcurrent(t *testing.T, env Env) {
+	const n = 16
+	ctx := context.Background()
+	start := make(chan struct{})
+	holds := make([]*glock.Lock, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			holds[i], errs[i] = env.Locker.TryAcquire(ctx, fmt.Sprintf("cold%02d", i))
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Errorf("concurrent first use %d: %v", i, errs[i])
+			continue
+		}
+		if err := holds[i].Release(ctx); err != nil {
+			t.Errorf("release %d: %v", i, err)
+		}
+	}
+}
 
 func testMutex(t *testing.T, env Env) {
 	ctx := context.Background()

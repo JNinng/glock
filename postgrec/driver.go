@@ -50,7 +50,8 @@ BEGIN
   ) THEN
     BEGIN
       -- CREATE TRIGGER 取表级排他锁：只在缺失时执行，避免与并发的锁操作
-      -- 事务（advisory + 行锁）互相等待。并发冷启动撞车按已创建处理。
+      -- 事务（advisory + 行锁）互相等待。duplicate_object 只兜底 glock
+      -- 之外路径（如手工建触发器）的并发创建。
       CREATE TRIGGER glock_locks_notify
       AFTER DELETE OR UPDATE ON glock_locks
       FOR EACH ROW EXECUTE FUNCTION glock_notify_change();
@@ -63,10 +64,28 @@ END $$;
 // notifyChannel 是释放唤醒的 LISTEN/NOTIFY 通道，payload 为记录的 key。
 const notifyChannel = "glock_change"
 
-// EnsureSchema 幂等建表。首个锁操作前会自动尝试（成功一次后跳过）；
+// schemaLockKey 是 EnsureSchema 串行化用的固定键：DDL 会更新 pg_proc 等
+// 系统目录，多会话并发执行同样的“幂等 DDL”仍会撞出 XX000/23505/42P07
+// （幂等只消除对象已存在，不消除目录行竞争）。键不带命名空间前缀：建表
+// 是库级一次性事件，全部 Driver 实例须会合到同一把锁上。
+const schemaLockKey = "glock:schema"
+
+// EnsureSchema 幂等建表，经事务级 advisory 锁在库级串行执行——并发冷启动
+// （多实例同时首调）排队而非撞车。首个锁操作前会自动尝试（成功一次后跳过）；
 // 显式调用可预热并提前暴露权限问题。
 func (d *Driver) EnsureSchema(ctx context.Context) error {
-	if _, err := d.pool.Exec(ctx, schemaDDL); err != nil {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgrec: ensure schema: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, schemaLockKey); err != nil {
+		return fmt.Errorf("postgrec: ensure schema: %w", err)
+	}
+	if _, err := tx.Exec(ctx, schemaDDL); err != nil {
+		return fmt.Errorf("postgrec: ensure schema: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("postgrec: ensure schema: %w", err)
 	}
 	d.schemaReady.Store(true)
@@ -74,7 +93,6 @@ func (d *Driver) EnsureSchema(ctx context.Context) error {
 }
 
 // ensureSchema 首个操作前自动建表；失败不置位，下个操作重试。
-// DDL 幂等（IF NOT EXISTS），并发首调最坏情况是一次可重试错误。
 func (d *Driver) ensureSchema(ctx context.Context) error {
 	if d.schemaReady.Load() {
 		return nil

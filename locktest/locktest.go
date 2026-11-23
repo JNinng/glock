@@ -57,6 +57,9 @@ func RunSuite(t *testing.T, f Factory) {
 			test(t, env)
 		})
 	}
+	// 排在最前：本用例必须是不预热 schema 的后端（见 backend/local_test.go）
+	// 的首次后端操作，并发首用才会与惰性初始化相撞；排后会被前面的子测试预热。
+	run("ColdStart_ConcurrentFirstUse_AllSucceed", testColdStartConcurrent)
 	run("Mutex", testMutex)
 	run("AcquireBlockingRetries", testAcquireBlockingRetries)
 	run("AcquireCtxDoneWrapsErrHeld", testAcquireCtxDone)
