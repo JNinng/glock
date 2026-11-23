@@ -2,7 +2,7 @@
 
 仓库按 `github.com/jninng/glock`（核心契约与编排，观测接缝为 slog 与 otel API：
 `otel` 根包的全局 provider 加 `otel/metric`）、`glock/redisc`、`glock/postgrec`、
-`glock/locktest`（一致性测试套件）拆分独立 Go module，使用方 `go get github.com/jninng/glock/redisc` 时只把该后端的依赖写进自己的
+`glock/locktest`（一致性测试套件）、`glock/example`（黑盒能力自检）拆分独立 Go module，使用方 `go get github.com/jninng/glock/redisc` 时只把该后端的依赖写进自己的
 go.mod/go.sum。
 
 core 引入 slog（stdlib）与 otel API（`otel` 根包、`otel/metric`；官方 API，
