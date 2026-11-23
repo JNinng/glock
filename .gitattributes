@@ -1,0 +1,7 @@
+# 行尾显式声明：仓库与工作区统一 LF。
+# gofmt 要求 LF；eol=lf 使 Windows core.autocrlf 不再改写工作区行尾，
+# gofmt -l 不再因行尾产生假阳性。
+* text=auto eol=lf
+
+# 二进制兜底
+*.exe binary
