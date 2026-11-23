@@ -42,8 +42,8 @@ Postgres：
 ```go
 pool, _ := pgxpool.New(ctx, "postgres://...")
 locker := postgrec.New(pool)
-// 表与栅栏序列在首个锁操作前自动创建（幂等 DDL）；
-// 可选显式预热：locker.EnsureSchema(ctx)。
+// 表与栅栏序列在首个锁操作前自动创建（幂等 DDL，advisory 锁下串行，
+// 多实例并发冷启动安全）；可选显式预热：locker.EnsureSchema(ctx)。
 
 // 可选：后台清扫过期行（获取路径本身已惰性清理）。
 go locker.RunReaper(ctx, time.Minute)

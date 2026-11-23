@@ -17,3 +17,4 @@ advisory，但能完整实现 glock 的全部语义契约。
   串行化——仅作事务内互斥量，随提交自动释放，兼容 PgBouncer 事务池化；锁的语义本体仍是租约表，不依赖会话级 advisory。
 - 过期行在获取路径惰性删除，可选 RunReaper 后台清扫，无必须运行的外部组件。
 - 表、索引与栅栏序列在首个锁操作前自动创建（幂等 DDL，成功一次后跳过）；EnsureSchema 仅供显式预热。
+- 幂等不消除系统目录行的并发竞争（CREATE OR REPLACE FUNCTION 等并发执行会撞 XX000/23505）：EnsureSchema 的 DDL 在 DDL 专用事务级 advisory 锁下串行执行，多实例并发冷启动排队而非报错。
