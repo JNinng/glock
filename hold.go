@@ -114,6 +114,7 @@ func (h *hold) markLost(ctx context.Context, reason error) {
 	})
 }
 
+// ended 报告持有是否已终结；已终结返回包装 ErrLost 的错误，仍有效返回 nil。
 func (h *hold) ended() error {
 	if h.dead.Load() {
 		return fmt.Errorf("%w: hold already ended", ErrLost)

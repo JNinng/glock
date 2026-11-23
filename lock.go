@@ -66,7 +66,7 @@ func (l *Lock) OwnerToken() string { return l.h.OwnerToken() }
 // FencingToken 返回本次获取事件的栅栏令牌（强制契约，单调递增）。
 func (l *Lock) FencingToken() uint64 { return l.h.FencingToken() }
 
-// ReadLock 是共享（读）持有的句柄。无 Downgrade（升级方向明确不做）。
+// ReadLock 是共享（读）持有的句柄。无 Downgrade；读→写升级也明确不提供。
 type ReadLock struct {
 	h *hold
 }

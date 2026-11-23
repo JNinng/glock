@@ -89,7 +89,7 @@ func discoverPostgres(ctx context.Context) (backend, bool) {
 	if err != nil {
 		return fail(err)
 	}
-	// 探测与预热同样限时（对齐 Redis 侧的 2s）：异常网络下不长时间挂住启动。
+	// 探测限时 2s（与 Redis 侧对齐），预热另有限时：异常网络下不长时间挂住启动。
 	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	if err = pool.Ping(pingCtx); err != nil {

@@ -35,7 +35,8 @@ import (
 	glock "github.com/jninng/glock"
 )
 
-// Locker 是 Postgres 后端，实现 glock 全部能力接口。
+// Locker 是 Postgres 后端，实现 glock 全部能力接口（Locker/RWLocker/MultiLocker/
+// ProbingLocker），经内嵌 BasicLocker 统一编排获得。
 type Locker struct {
 	*glock.BasicLocker
 	drv  *Driver

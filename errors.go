@@ -12,8 +12,8 @@ var (
 	// 已降级转移——句柄不再背书互斥。
 	ErrLost = errors.New("glock: hold lost")
 
-	// ErrNotOwner 表示变更操作被后端拒绝：Owner Token 或栅栏代际与当前记录不符
-	//（防误删）。出现即意味着持有已丢失。
+	// ErrNotOwner 表示变更操作被后端拒绝：Owner Token、栅栏代际或模式与当前
+	// 记录不符，或租约已过期（防误删）。出现即意味着持有已丢失。
 	ErrNotOwner = errors.New("glock: mutation rejected, not owner")
 
 	// ErrModeConflict 表示同 Owner 在同一 Key 上的模式冲突：持写再取读、

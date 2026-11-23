@@ -11,16 +11,12 @@ import (
 // 可能已取消，释放不能与之同生共死；同时避免后端失联时无限挂起。
 const withLockReleaseTimeout = 5 * time.Second
 
-// WithLock 封装最常用的样板：阻塞获取（Acquire）→ 执行 fn → 释放。
+// WithLock 封装最常用的样板：阻塞获取 → 执行 fn → 自动释放。fn 收到持有句柄与派生 ctx：
+// 持有丢失时派生 ctx 被取消且 context.Cause(fnCtx) 为 ErrLost，fn 应尽快返回；丢失发现
+// 的及时性取决于 watchdog——固定租约模式下丢失只能由释放、显式续期等操作被动暴露。
 //
-// fn 收到本次持有的句柄与一个派生 ctx。持有丢失（续期失败、租约被接管）时
-// 派生 ctx 被取消，context.Cause(fnCtx) 为 ErrLost，fn 应尽快返回；调用方
-// 取消则保持原 cause。能否及时发现丢失取决于 watchdog——固定租约模式只在
-// 释放时暴露 ErrLost。
-//
-// fn 返回后总会释放，释放不依赖调用方 ctx（即使已取消，使用独立的 5 秒
-// 预算）；fn 不应自行 Release/Downgrade 句柄。fn 或释放任一失败时错误用
-// errors.Join 合并：fn 忽略取消、越过丢失继续工作时，返回值包含 ErrLost，
+// fn 返回后总会释放（不依赖调用方 ctx，独立 5 秒预算），fn 不应自行 Release/Downgrade
+// 句柄。fn 与释放的错误用 errors.Join 合并：fn 执行期间发生过丢失时返回值包含 ErrLost，
 // 调用方应据此判断本次临界区结果可能与接管者交错。
 func (l *BasicLocker) WithLock(ctx context.Context, key string, fn func(ctx context.Context, lock *Lock) error, opts ...AcquireOption) (err error) {
 	lk, err := l.Acquire(ctx, key, opts...)

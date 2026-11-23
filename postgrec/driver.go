@@ -82,6 +82,7 @@ func (d *Driver) ensureSchema(ctx context.Context) error {
 	return d.EnsureSchema(ctx)
 }
 
+// rowRec 是 glock_locks 一行持有记录的内存快照。
 type rowRec struct {
 	owner string
 	mode  string
@@ -89,7 +90,10 @@ type rowRec struct {
 	fence int64
 }
 
-// TryAcquire 实现 glock.Driver。
+// TryAcquire 实现 glock.Driver。事务内按 Key 串行化并惰性清理过期行后判定：
+// 全新获取经全局序列签发新栅栏；同 Owner 同模式且租约存活的重入沿用既有
+// 栅栏；竞争失败返回 ErrHeld，同 Owner 反模式（持读取写、持写取读）返回
+// ErrModeConflict。
 func (d *Driver) TryAcquire(ctx context.Context, key string, mode glock.Mode, owner string, lease time.Duration) (uint64, error) {
 	fail := func(op string, err error) (uint64, error) {
 		return 0, fmt.Errorf("postgrec: %s %q: %w", op, key, err)
@@ -379,6 +383,7 @@ func (d *Driver) rowsFor(ctx context.Context, tx pgx.Tx, key string) ([]rowRec, 
 	return out, rows.Err()
 }
 
+// insertHold 插入新持有行（栅栏取自全局序列）并提交事务，返回签发的栅栏。
 func (d *Driver) insertHold(ctx context.Context, tx pgx.Tx, key, owner, mode string, lease time.Duration) (uint64, error) {
 	var fence int64
 	err := tx.QueryRow(ctx,
@@ -395,6 +400,7 @@ func (d *Driver) insertHold(ctx context.Context, tx pgx.Tx, key, owner, mode str
 	return uint64(fence), nil
 }
 
+// rowsAffected 将 0 行更新映射为 ErrNotOwner（防误删拒绝）。
 func rowsAffected(key, op string, tag pgconn.CommandTag) error {
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("postgrec: %s %q: %w", op, key, glock.ErrNotOwner)

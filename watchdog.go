@@ -14,7 +14,7 @@ func jitter(d time.Duration) time.Duration {
 	return time.Duration(float64(d) * f)
 }
 
-// watchdog 周期性为一组持有续约：单锁一组一个成员，多锁整组一个。
+// watchdog 周期性为一组持有续约：单锁即单成员组，多锁整组共用一个。
 // 任一成员续约失败即整组标记丢失并停止。
 type watchdog struct {
 	holds    []*hold

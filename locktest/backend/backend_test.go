@@ -15,7 +15,7 @@ import (
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
-// redis/Postgres 容器与真实客户端跑同一套契约：接口的语义就是这套测试。
+// Redis/Postgres 容器与真实客户端跑同一套契约：接口的语义就是这套测试。
 
 func TestRedisConformance(t *testing.T) {
 	ctx := context.Background()

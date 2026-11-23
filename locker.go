@@ -56,7 +56,7 @@ type BasicLocker struct {
 // NewBasicLocker 基于 Driver 构造 Locker。日志默认静默（discard handler），
 // 指标默认经由 otel 全局 MeterProvider（未配置即 noop，SetMeterProvider
 // 后自动接入），租约默认 DefaultLease、无后台续期，可用 WithLogger/
-// WithMeter/WithDefaultLease/WithDefaultWatchdog 覆盖。
+// WithMeter/WithNamespace/WithDefaultLease/WithDefaultWatchdog 覆盖。
 func NewBasicLocker(drv Driver, opts ...Option) *BasicLocker {
 	cfg := newLockerConfig(opts)
 	return &BasicLocker{
@@ -101,7 +101,7 @@ func (l *BasicLocker) AcquireRead(ctx context.Context, key string, opts ...Acqui
 	return &ReadLock{h: h}, nil
 }
 
-// tryAcquire 是单 Key 获取主循环（含重试），成功后按配置启动单锁 watchdog。
+// tryAcquire 完成单 Key 获取（重试循环在 acquireOne），成功后按配置启动单锁 watchdog。
 func (l *BasicLocker) tryAcquire(ctx context.Context, key string, mode Mode, opts []AcquireOption, blocking bool) (*hold, error) {
 	cfg, err := l.newAcquireConfig(opts)
 	if err != nil {

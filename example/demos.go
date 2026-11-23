@@ -1,39 +1,8 @@
 package main
 
-// 能力 ↔ 检查对照。新增能力时：写一个 demoXxx 函数并在 demos 登记。
-//
-// 单持有者语义：
-//
-//	互斥竞争 / ErrHeld             demoMutex
-//	固定租约 / 到期自动释放 / 防误删  demoLease
-//	watchdog 自动续期              demoWatchdog
-//	读写锁 / 模式冲突              demoReadWrite
-//	写降读                        demoDowngrade
-//	可重入 / WAL 恢复              demoReentrant
-//	多锁全有或全无                 demoMultiLock
-//	WithLock 执行辅助              demoWithLock
-//	Probe 状态内省                 demoProbe
-//	Locker 级默认配置              demoDefaults
-//	Fencing Token 单调             demoFencing
-//	句柄终结语义                   demoHandleTerminal
-//	命名空间隔离                   demoNamespaceIsolation
-//	Probe 过期残余不算持有          demoProbeExpiryResidue
-//	特殊字符 Key                   demoSpecialKeys
-//
-// 并发对撞（只断言计数/集合等确定性不变量，不依赖时序，不会 flaky）：
-//
-//	赢家唯一对撞                   demoWinnerUnique
-//	计数器对撞（端到端正确性）        demoCounterCollision
-//	交叉多锁无死锁                  demoCrossMultiLock
-//	多读者对撞                     demoReadersCollision
-//	watchdog 压力竞争              demoWatchdogPressure
-//	同 token 并发重入              demoReentrantCollision
-//
-// 阻塞语义：
-//
-//	阻塞获取 + 释放唤醒             demoBlockingWake
-//	阻塞等待过期接管                demoBlockingExpiryWake
-//	ctx 取消的错误包装              demoCtxCancel
+// 能力 ↔ 检查对照。新增能力时：写一个 demoXxx 函数并在 demos 登记，
+// 逐项映射见 demos 列表与各 demo 函数。三组：单持有者语义、并发对撞
+//（只断言计数/集合等确定性不变量，不依赖时序，不会 flaky）、阻塞语义。
 
 import (
 	"context"
@@ -85,6 +54,7 @@ type demo struct {
 	run  func(ctx context.Context, e env, lg glock.Locker) error
 }
 
+// demos 是检查登记表，顺序即 runSuite 的执行顺序。
 var demos = []demo{
 	{"互斥与 ErrHeld", demoMutex},
 	{"阻塞获取与释放唤醒", demoBlockingWake},
@@ -742,12 +712,13 @@ func demoReentrantCollision(ctx context.Context, _ env, lg glock.Locker) error {
 	return wantOK("清理", other.Release(ctx))
 }
 
-// ---- 经典场景：README 承诺过的契约，黑盒侧补齐 ----
+// ---- 经典场景：契约边角与常见踩坑，黑盒侧补验 ----
 
 func demoBlockingExpiryWake(ctx context.Context, _ env, lg glock.Locker) error {
 	// 持有者只设短租约、从不 Release：阻塞方须在租约过期后靠接管拿到锁。
-	// postgrec 走过期行删除的触发器通知，redisc 走轮询兜底——两个后端机制
-	// 不同，同一断言都应通过。
+	// 过期本身没有推送：postgrec 触发器只在行删除/写降读时发通知（本例
+	// 未启动 reaper，接管由轮询中的惰性清理完成），redisc 只有释放信号——
+	// 两个后端的唤醒都落回轮询，同一断言都应通过。
 	if _, err := lg.TryAcquire(ctx, "bexpire", glock.WithOwner("holder"), glock.WithLease(600*time.Millisecond)); err != nil {
 		return wantOK("holder TryAcquire", err)
 	}

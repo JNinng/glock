@@ -50,7 +50,7 @@ func (l *BasicLocker) newAcquireConfig(opts []AcquireOption) (acquireConfig, err
 
 // WithOwner 指定 Owner Token（持有者身份），默认自动生成。
 // 崩溃恢复场景：业务把 token 持久化（如写入 WAL），恢复后以同一 token 重新
-// Acquire，结果可能是重入、竞争或全新获取。
+// Acquire，结果可能是重入、模式冲突或全新获取。
 func WithOwner(token string) AcquireOption {
 	return func(c *acquireConfig) { c.owner = token }
 }

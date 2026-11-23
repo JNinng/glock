@@ -7,6 +7,7 @@ import (
 	"time"
 )
 
+// newTestLocker 是根包测试的统一构造：固定 "t:" 命名空间，fake 侧键为 "t:"+key。
 func newTestLocker(drv *fakeDriver) *BasicLocker {
 	return NewBasicLocker(drv, WithNamespace("t:"))
 }
@@ -161,7 +162,7 @@ func TestWatchdogMarksLostWhenRecordVanishes(t *testing.T) {
 	if err := h.Release(ctx); !errors.Is(err, ErrLost) {
 		t.Fatalf("release after lost want ErrLost, got %v", err)
 	}
-	// 丢失后绝不误删：记录由接管者持有，其他 owner 仍可正常竞争。
+	// 丢失后的释放被拒绝（防误删）：绝不误删现行记录，其他 owner 仍可正常获取。
 	if _, err := l.TryAcquire(ctx, "k", WithOwner("other")); err != nil {
 		t.Fatalf("after loss other owner should acquire freely: %v", err)
 	}

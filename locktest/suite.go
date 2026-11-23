@@ -401,7 +401,7 @@ func testMultiSharedWatchdog(t *testing.T, env Env) {
 
 func testMultiNoCrossDeadlock(t *testing.T, env Env) {
 	ctx := context.Background()
-	// 两个竞争者以不同顺序请求同一组 Key；字典序获取应避免死锁。
+	// 两个竞争者并发请求同一组 Key；AcquireAll 按字典序加锁，应避免交叉死锁。
 	done := make(chan error, 2)
 	acquire := func(owner string) {
 		ml, err := env.Multi.AcquireAll(ctx, []string{"d1", "d2", "d3"}, glock.WithOwner(owner),

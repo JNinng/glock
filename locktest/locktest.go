@@ -5,11 +5,8 @@
 //
 //	locktest.RunSuite(t, func(t *testing.T, ns string) locktest.Env {
 //	    locker := mybackend.New(client, glock.WithNamespace(ns))
-//	    return locktest.Env{
-//	        Locker: locker, RW: locker, Multi: locker,
-//	        Saboteur: mySaboteur{ns: ns}, // Drop 模拟后端数据消失
-//	        Prober: locker, // 可选：Driver 实现 glock.ProbingDriver 时填入
-//	    }
+//	    return locktest.Env{Locker: locker, RW: locker, Multi: locker,
+//	        Saboteur: mySaboteur{ns: ns}, Prober: locker}
 //	})
 package locktest
 
@@ -28,6 +25,7 @@ type Saboteur interface {
 }
 
 // Env 是一套被测环境：Locker 加上按能力拆开的接口与破坏钩子。
+// Locker/RW/Multi/Saboteur 必填，Prober/Notifier 可选。
 type Env struct {
 	Locker   glock.Locker
 	RW       glock.RWLocker    // v1 契约必填

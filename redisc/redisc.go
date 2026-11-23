@@ -33,11 +33,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// 默认物理键前缀：效果为 glock:{<key>} 与 glock:{<key>}:f。
+// DefaultKeyPrefix 默认物理键前缀：效果为 glock:{<key>} 与 glock:{<key>}:f。
 const DefaultKeyPrefix = "glock:"
 
 // New 返回基于 go-redis 的 Locker，实现 glock 全部能力接口
-// （Locker、RWLocker、MultiLocker），键布局为默认前缀 glock:{<key>}。
+// （Locker、RWLocker、MultiLocker、ProbingLocker），键布局为默认前缀 glock:{<key>}。
 // client 由调用方管理生命周期；需要自定义键前缀时用 NewDriver + glock.NewBasicLocker。
 func New(client redis.UniversalClient, opts ...glock.Option) *glock.BasicLocker {
 	return glock.NewBasicLocker(NewDriver(client), opts...)
@@ -71,8 +71,8 @@ func NewDriver(client redis.UniversalClient, opts ...DriverOption) *Driver {
 	return &Driver{client: client, prefix: c.prefix}
 }
 
-// 返回码约定（Lua 数组首元素）：1 成功，2 成功且记录已删除（用于发布唤醒
-// 信号），0 被他人持有，-1 防误删拒绝，-2 模式冲突。
+// Lua 返回码约定（acquire 返回数组，首元素为码，成功附栅栏；其余脚本返回单整数）：
+// 1 成功，2 成功且记录已删除（用于发布唤醒信号），0 被他人持有，-1 防误删拒绝，-2 模式冲突。
 const (
 	retOK       = 1
 	retReleased = 2
@@ -283,8 +283,8 @@ func (d *Driver) lockKey(key string) string { return d.prefix + "{" + key + "}" 
 // fenceKey 返回栅栏计数的物理键：<prefix>{<key>}:f（与锁记录同 slot）。
 func (d *Driver) fenceKey(key string) string { return d.prefix + "{" + key + "}:f" }
 
-// notifyKey 返回释放唤醒的发布通道：<prefix>{<key>}:n（与锁记录同 slot，
-// Cluster 下订阅经由同 slot 路由）。
+// notifyKey 返回释放唤醒的发布通道：<prefix>{<key>}:n（与锁记录同 slot；
+// Cluster 常规 Pub/Sub 为全节点广播，投递不依赖 slot 路由）。
 func (d *Driver) notifyKey(key string) string { return d.prefix + "{" + key + "}:n" }
 
 // TryAcquire 实现 glock.Driver。

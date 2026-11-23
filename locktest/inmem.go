@@ -68,6 +68,7 @@ func (d *InmemDriver) WaitForChange(ctx context.Context, key string, maxWait tim
 	}
 }
 
+// live 报告记录存在且至少一份持有租约未过期；整体过期不算存活，可被接管。
 func (d *InmemDriver) live(r *inmemRec, now time.Time) bool {
 	if r == nil {
 		return false
@@ -83,6 +84,7 @@ func (d *InmemDriver) live(r *inmemRec, now time.Time) bool {
 	return false
 }
 
+// purge 清除记录中已过期的持有（获取路径的惰性清理）。
 func (d *InmemDriver) purge(r *inmemRec, now time.Time) {
 	if r.mode == glock.Write {
 		if r.writer != nil && !r.writer.expires.After(now) {
