@@ -12,7 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	glock "github.com/jninng/glock"
+	"github.com/jninng/glock/postgrec"
+	"github.com/jninng/glock/redisc"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 // collideN 是对撞类演示的并发规模，roundsM 是计数器对撞的临界区次数。
@@ -43,15 +47,32 @@ func runCollide(n int, fn func(i int) error) []error {
 }
 
 // env 传给每个检查：ns 与基础 Locker 同域，newLocker 供构造级选项的检查
-// 另建 Locker 实例。
+// 另建 Locker 实例；rdb/pool 是后端专属句柄（下游栅栏防护 demo 用），
+// 非本后端为 nil。
 type env struct {
 	newLocker func(opts ...glock.Option) glock.Locker
 	ns        string
+	rdb       *goredis.Client
+	pool      *pgxpool.Pool
 }
 
 type demo struct {
 	name string
 	run  func(ctx context.Context, e env, lg glock.Locker) error
+}
+
+// backendDemo 依赖后端专属句柄（通用 demos 只走 Locker 接口）：ok 为 false
+// 的后端显示 SKIP，不计失败。
+type backendDemo struct {
+	name string
+	ok   func(e env) bool
+	run  func(ctx context.Context, e env, lg glock.Locker) error
+}
+
+// backendDemos 是后端专属检查登记表，紧随通用 demos 执行。
+var backendDemos = []backendDemo{
+	{"下游栅栏防护（Redis CAS）", func(e env) bool { return e.rdb != nil }, demoFenceGuardRedis},
+	{"下游栅栏防护（PG 条件更新）", func(e env) bool { return e.pool != nil }, demoFenceGuardPG},
 }
 
 // demos 是检查登记表，顺序即 runSuite 的执行顺序。
@@ -933,6 +954,150 @@ func demoSpecialKeys(ctx context.Context, _ env, lg glock.Locker) error {
 		if err := wantOK(fmt.Sprintf("释放 %q", key), h.Release(ctx)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// demoFenceGuardRedis 验证下游栅栏 CAS（redisc.FencedSet/FencedGet）：新代
+// 与相等栅栏的写入放行，迟到的旧持有者写入被拒且业务值不变，零栅栏显式
+// 报错。守护键带 ns 隔离，与各次运行互不干扰。
+func demoFenceGuardRedis(ctx context.Context, e env, lg glock.Locker) error {
+	key := e.ns + "fence/guard"
+	hA, err := lg.TryAcquire(ctx, "fence/guard", glock.WithOwner("A"))
+	if err := wantOK("A 获取", err); err != nil {
+		return err
+	}
+	f1 := hA.FencingToken()
+
+	acc, err := redisc.FencedSet(ctx, e.rdb, key, f1, "v1", 0)
+	if err := wantOK("首写", err); err != nil {
+		return err
+	}
+	if !acc {
+		return fmt.Errorf("首写被拒, want accepted")
+	}
+	_, f, ok, err := redisc.FencedGet(ctx, e.rdb, key)
+	if err := wantOK("读回", err); err != nil {
+		return err
+	}
+	if !ok || f != f1 {
+		return fmt.Errorf("读回 ok=%v fence=%d, want ok 且 fence=%d", ok, f, f1)
+	}
+
+	// 相等栅栏放行：可重入沿用同一栅栏，同代持有者的再次写入不是迟到写入。
+	if acc, err := redisc.FencedSet(ctx, e.rdb, key, f1, "v1b", 0); err != nil || !acc {
+		return fmt.Errorf("相等栅栏写入 acc=%v err=%v, want accepted", acc, err)
+	}
+	if err := wantOK("A 释放", hA.Release(ctx)); err != nil {
+		return err
+	}
+
+	hB, err := lg.Acquire(ctx, "fence/guard", glock.WithOwner("B"))
+	if err := wantOK("B 接管", err); err != nil {
+		return err
+	}
+	defer hB.Release(context.Background())
+	f2 := hB.FencingToken()
+	if f2 <= f1 {
+		return fmt.Errorf("栅栏未单调递增: %d after %d", f2, f1)
+	}
+	if acc, err := redisc.FencedSet(ctx, e.rdb, key, f2, "v2", 0); err != nil || !acc {
+		return fmt.Errorf("新持有者写入 acc=%v err=%v, want accepted", acc, err)
+	}
+
+	// 迟到的旧持有者写入被拒，业务值不变。
+	acc, err = redisc.FencedSet(ctx, e.rdb, key, f1, "zombie", 0)
+	if err != nil {
+		return fmt.Errorf("迟到写入报错: %w（拒绝是正常结果，不该报错）", err)
+	}
+	if acc {
+		return fmt.Errorf("迟到写入被接受, want rejected")
+	}
+	if v, _, _, _ := redisc.FencedGet(ctx, e.rdb, key); v != "v2" {
+		return fmt.Errorf("拒绝后业务值 = %q, want v2", v)
+	}
+
+	// 零栅栏只能来自未初始化变量：显式报错而非静默接受。
+	if _, err := redisc.FencedSet(ctx, e.rdb, key, 0, "x", 0); err == nil {
+		return fmt.Errorf("fence=0 被接受, want error")
+	}
+	return nil
+}
+
+// demoFenceGuardPG 验证下游栅栏条件更新（postgrec.FencedUpsertSQL 构造的
+// upsert）：新代与相等栅栏的写入影响 1 行，迟到的旧持有者写入影响 0 行且
+// 业务值不变。示例表与栅栏行均在库中留痕无害（幂等建表、行带 ns 隔离），
+// 成功路径清理本行。
+func demoFenceGuardPG(ctx context.Context, e env, lg glock.Locker) error {
+	q, err := postgrec.FencedUpsertSQL("glock_fence_example", "id", []string{"val"}, "fence")
+	if err := wantOK("构造条件更新语句", err); err != nil {
+		return err
+	}
+	if _, err := e.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS glock_fence_example
+  (id text PRIMARY KEY, val text, fence bigint NOT NULL DEFAULT 0)`); err != nil {
+		return fmt.Errorf("建示例表: %w", err)
+	}
+	id := e.ns + "row"
+	defer e.pool.Exec(context.Background(), `DELETE FROM glock_fence_example WHERE id = $1`, id)
+
+	hA, err := lg.TryAcquire(ctx, "fence/guard", glock.WithOwner("A"))
+	if err := wantOK("A 获取", err); err != nil {
+		return err
+	}
+	f1 := hA.FencingToken()
+
+	// 首写插入（行不存在，无栅栏可比）。
+	tag, err := e.pool.Exec(ctx, q, id, "v1", f1)
+	if err := wantOK("首写", err); err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("首写影响 %d 行, want 1", tag.RowsAffected())
+	}
+
+	// 相等栅栏放行（可重入语义）。
+	tag, err = e.pool.Exec(ctx, q, id, "v1b", f1)
+	if err := wantOK("相等栅栏写入", err); err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("相等栅栏写入影响 %d 行, want 1", tag.RowsAffected())
+	}
+	if err := wantOK("A 释放", hA.Release(ctx)); err != nil {
+		return err
+	}
+
+	hB, err := lg.Acquire(ctx, "fence/guard", glock.WithOwner("B"))
+	if err := wantOK("B 接管", err); err != nil {
+		return err
+	}
+	defer hB.Release(context.Background())
+	f2 := hB.FencingToken()
+	if f2 <= f1 {
+		return fmt.Errorf("栅栏未单调递增: %d after %d", f2, f1)
+	}
+	tag, err = e.pool.Exec(ctx, q, id, "v2", f2)
+	if err := wantOK("新持有者写入", err); err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("新持有者写入影响 %d 行, want 1", tag.RowsAffected())
+	}
+
+	// 迟到的旧持有者写入影响 0 行，业务值不变。
+	tag, err = e.pool.Exec(ctx, q, id, "zombie", f1)
+	if err := wantOK("迟到写入", err); err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 0 {
+		return fmt.Errorf("迟到写入影响 %d 行, want 0（拒绝以 0 行表达）", tag.RowsAffected())
+	}
+	var val string
+	if err := e.pool.QueryRow(ctx, `SELECT val FROM glock_fence_example WHERE id = $1`, id).Scan(&val); err != nil {
+		return fmt.Errorf("读回: %w", err)
+	}
+	if val != "v2" {
+		return fmt.Errorf("拒绝后业务值 = %q, want v2", val)
 	}
 	return nil
 }

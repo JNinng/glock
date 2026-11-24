@@ -24,11 +24,14 @@ import (
 )
 
 // backend 是一个可达后端：newLocker 按需构造同后端的 Locker 实例（供
-// 构造级选项的检查另建），close 释放底层资源。
+// 构造级选项的检查另建），close 释放底层资源；rdb/pool 是后端专属句柄
+// （下游栅栏防护检查用），非本后端为 nil。
 type backend struct {
 	name      string
 	newLocker func(opts ...glock.Option) glock.Locker
 	close     func()
+	rdb       *goredis.Client
+	pool      *pgxpool.Pool
 }
 
 func main() {
@@ -76,6 +79,7 @@ func discoverRedis(ctx context.Context) (backend, bool) {
 		name:      "Redis " + addr,
 		newLocker: func(opts ...glock.Option) glock.Locker { return redisc.New(rdb, opts...) },
 		close:     func() { _ = rdb.Close() },
+		rdb:       rdb,
 	}, true
 }
 
@@ -107,6 +111,7 @@ func discoverPostgres(ctx context.Context) (backend, bool) {
 		name:      "Postgres",
 		newLocker: func(opts ...glock.Option) glock.Locker { return postgrec.New(pool, opts...) },
 		close:     pool.Close,
+		pool:      pool,
 	}, true
 }
 
@@ -118,10 +123,28 @@ func runSuite(b backend) int {
 
 	ns := fmt.Sprintf("example/%d/", time.Now().UnixNano())
 	lg := b.newLocker(glock.WithNamespace(ns))
-	e := env{newLocker: b.newLocker, ns: ns}
+	e := env{newLocker: b.newLocker, ns: ns, rdb: b.rdb, pool: b.pool}
+
+	// 执行序列 = 通用 demos + 后端专属 backendDemos（句柄缺失的后端 SKIP）。
+	type item struct {
+		name string
+		run  func(context.Context, env, glock.Locker) error
+		skip bool
+	}
+	items := make([]item, 0, len(demos)+len(backendDemos))
+	for _, d := range demos {
+		items = append(items, item{d.name, d.run, false})
+	}
+	for _, d := range backendDemos {
+		items = append(items, item{d.name, d.run, !d.ok(e)})
+	}
 
 	failed := 0
-	for _, d := range demos {
+	for _, d := range items {
+		if d.skip {
+			fmt.Printf("SKIP\t%s\n", d.name)
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		start := time.Now()
 		err := d.run(ctx, e, lg)

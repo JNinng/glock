@@ -33,8 +33,9 @@ lk, err := locker.Acquire(ctx, "job:42", glock.WithWatchdog())
 if err != nil { /* ErrHeld：被他人持有 */ }
 defer lk.Release(context.Background())
 
-// 交给下游存储拒绝旧持有者的迟到写入（自动释放场景的正确性补救）。
-writeWithFence(lk.FencingToken())
+// 下游栅栏防护：把令牌交给下游存储拒绝旧持有者的迟到写入（自动释放
+// 场景的正确性补救，接受 >=、拒绝 <、相等放行给可重入）。
+redisc.FencedSet(ctx, rdb, "state:job:42", lk.FencingToken(), payload, time.Hour)
 ```
 
 Postgres：
@@ -47,6 +48,10 @@ locker := postgrec.New(pool)
 
 // 可选：后台清扫过期行（获取路径本身已惰性清理）。
 go locker.RunReaper(ctx, time.Minute)
+
+// 下游栅栏防护：业务表加 fence 列（NOT NULL DEFAULT 0），条件更新影响
+// 0 行即迟到写入被拒。q, err := postgrec.FencedUpsertSQL("jobs", "id",
+// []string{"state"}, "fence")；tx.Exec(ctx, q, "42", state, lk.FencingToken())。
 ```
 
 ## 能力与用法一览
@@ -65,6 +70,7 @@ go locker.RunReaper(ctx, time.Minute)
 | 写降读    | `Lock.Downgrade(ctx)`（原子、栅栏不变、需写计数=1、旧句柄终结）                                                                                 |
 | 多锁     | `AcquireAll`（仅互斥、字典序防死锁、all-or-nothing 回滚）                                                                                  |
 | 信号量   | `AcquireSemaphore / TryAcquireSemaphore(ctx, key, n)`：N 上限槽位池，每槽一份租约与栅栏；容量随首个获取固定（不符返回 `ErrCapacityMismatch`），槽满返回 `ErrHeld`；Driver 实现 `SemaphoreDriver` 即具备，否则返回 `ErrUnsupported` |
+| 下游栅栏防护 | `redisc.FencedSet / FencedGet`（栅栏 CAS：接受 ≥、拒绝 <，拒绝返回 false）；`postgrec.FencedUpsertSQL`（条件更新构造器：影响 0 行即拒绝）。语义见 ADR-0007 |
 | 执行辅助   | `WithLock(ctx, key, fn)`：阻塞获取→fn→自动释放；watchdog 发现丢失时取消 fn 的 ctx（cause=ErrLost），丢失/释放失败并入返回值 |
 | 状态内省   | `Probe(ctx, key)`：只读列出存活持有（Owner、模式、剩余租约、Fence），按 Owner 排序；Driver 实现 `ProbingDriver` 即具备，否则返回 `ErrUnsupported` |
 | 观测     | 日志 `*slog.Logger`（`glock.WithLogger`，默认静默）；指标 otel `metric.Meter`（`glock.WithMeter`，默认跟随 `otel.SetMeterProvider`，未配置即 noop） |
