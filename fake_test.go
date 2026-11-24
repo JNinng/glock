@@ -14,6 +14,7 @@ import (
 type fakeDriver struct {
 	mu      sync.Mutex
 	recs    map[string]*fakeRec
+	sems    map[string]*fakeSem // 信号量记录：键空间与锁隔离
 	counter uint64
 	refresh int // Refresh 成功次数
 
@@ -28,6 +29,13 @@ type fakeRec struct {
 	readers map[string]*fakeHoldRec // 仅 Read 模式使用
 }
 
+// fakeSem 是一个信号量池：cap 在首个获取时固定，holders 为 Owner → 槽位
+// 计数与租约（同 Owner 的全部槽位共享一份租约）。
+type fakeSem struct {
+	cap     int
+	holders map[string]*fakeHoldRec
+}
+
 type fakeHoldRec struct {
 	count   int
 	fence   uint64
@@ -35,7 +43,7 @@ type fakeHoldRec struct {
 }
 
 func newFakeDriver() *fakeDriver {
-	return &fakeDriver{recs: map[string]*fakeRec{}, changed: map[string]chan struct{}{}}
+	return &fakeDriver{recs: map[string]*fakeRec{}, sems: map[string]*fakeSem{}, changed: map[string]chan struct{}{}}
 }
 
 func (d *fakeDriver) live(r *fakeRec, now time.Time) bool {
@@ -128,10 +136,88 @@ func (d *fakeDriver) holdOf(r *fakeRec, mode Mode, owner string) *fakeHoldRec {
 	return r.writer
 }
 
+// semLiveOf 取信号量池中 owner 的存活槽位记录，无效返回 nil。
+func (d *fakeDriver) semLiveOf(r *fakeSem, owner string, fence uint64, now time.Time) *fakeHoldRec {
+	if !d.semLive(r, now) {
+		return nil
+	}
+	h := r.holders[owner]
+	if h == nil || h.fence != fence || !h.expires.After(now) {
+		return nil
+	}
+	return h
+}
+
+// TryAcquireSemaphore 实现 glock.SemaphoreDriver。容量在池首个获取时固定；
+// 存活槽位已满返回 ErrHeld（重入同样受容量约束），容量声明不符返回
+// ErrCapacityMismatch；全部槽位过期清空后允许重新声明。
+func (d *fakeDriver) TryAcquireSemaphore(_ context.Context, key string, n int, owner string, lease time.Duration) (uint64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	r := d.sems[key]
+	if r != nil {
+		d.semPurge(r, now)
+	}
+	if d.semLive(r, now) {
+		if r.cap != n {
+			return 0, fmt.Errorf("fake: %w", ErrCapacityMismatch)
+		}
+		inUse := 0
+		for _, h := range r.holders {
+			inUse += h.count
+		}
+		if inUse >= n {
+			return 0, fmt.Errorf("fake: %w", ErrHeld)
+		}
+		if h, ok := r.holders[owner]; ok {
+			h.count++
+			h.expires = now.Add(lease)
+			return h.fence, nil // 重入多占槽位，沿用代际
+		}
+	} else {
+		// 全新池（记录不存在或槽位全部过期）：容量在此固定。
+		r = &fakeSem{cap: n, holders: map[string]*fakeHoldRec{}}
+		d.sems[key] = r
+	}
+	d.counter++
+	r.holders[owner] = &fakeHoldRec{count: 1, fence: d.counter, expires: now.Add(lease)}
+	return d.counter, nil
+}
+
+func (d *fakeDriver) semLive(r *fakeSem, now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	for _, h := range r.holders {
+		if h.expires.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *fakeDriver) semPurge(r *fakeSem, now time.Time) {
+	for o, h := range r.holders {
+		if !h.expires.After(now) {
+			delete(r.holders, o)
+		}
+	}
+}
+
 func (d *fakeDriver) Refresh(_ context.Context, key string, mode Mode, owner string, fence uint64, lease time.Duration) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
+	if mode == Semaphore {
+		r := d.sems[key]
+		if d.semLiveOf(r, owner, fence, now) == nil {
+			return fmt.Errorf("fake: %w", ErrNotOwner)
+		}
+		r.holders[owner].expires = now.Add(lease)
+		d.refresh++
+		return nil
+	}
 	r := d.recs[key]
 	if r == nil || r.mode != mode || !d.live(r, now) {
 		return fmt.Errorf("fake: %w", ErrNotOwner)
@@ -149,6 +235,22 @@ func (d *fakeDriver) Release(_ context.Context, key string, mode Mode, owner str
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
+	if mode == Semaphore {
+		r := d.sems[key]
+		if d.semLiveOf(r, owner, fence, now) == nil {
+			return fmt.Errorf("fake: %w", ErrNotOwner)
+		}
+		h := r.holders[owner]
+		h.count--
+		d.broadcast(key) // 槽位腾出：唤醒等待者（记录是否删净都广播）
+		if h.count <= 0 {
+			delete(r.holders, owner)
+			if len(r.holders) == 0 {
+				delete(d.sems, key)
+			}
+		}
+		return nil
+	}
 	r := d.recs[key]
 	if r == nil || r.mode != mode || !d.live(r, now) {
 		return fmt.Errorf("fake: %w", ErrNotOwner)
@@ -193,8 +295,8 @@ func (d *fakeDriver) Downgrade(_ context.Context, key, owner string, fence uint6
 }
 
 // broadcast 关闭 key 的唤醒通道（须持 d.mu 调用）：所有停靠的等待者立即
-// 返回，后续等待者拿新通道。对齐真实后端：只在记录删除（释放归零）与
-// 降级时广播，TryAcquire/Refresh 不广播。
+// 返回，后续等待者拿新通道。对齐真实后端：只在放行性变更（记录删除、降级、
+// 信号量槽位腾出）时广播，TryAcquire/Refresh 不广播。
 func (d *fakeDriver) broadcast(key string) {
 	if ch, ok := d.changed[key]; ok {
 		close(ch)
@@ -225,11 +327,12 @@ func (d *fakeDriver) WaitForChange(ctx context.Context, key string, maxWait time
 	}
 }
 
-// drop 删除记录，模拟后端数据消失（watchdog 丢失路径）。
+// drop 删除记录（锁与信号量键空间一并），模拟后端数据消失（watchdog 丢失路径）。
 func (d *fakeDriver) drop(key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.recs, key)
+	delete(d.sems, key)
 	d.broadcast(key)
 }
 

@@ -25,7 +25,7 @@ type Saboteur interface {
 }
 
 // Env 是一套被测环境：Locker 加上按能力拆开的接口与破坏钩子。
-// Locker/RW/Multi/Saboteur 必填，Prober/Notifier 可选。
+// Locker/RW/Multi/Saboteur 必填，Prober/Notifier/Sem 可选。
 type Env struct {
 	Locker   glock.Locker
 	RW       glock.RWLocker    // v1 契约必填
@@ -37,6 +37,9 @@ type Env struct {
 	// Notifier 承载释放唤醒能力（可选）：Driver 实现 glock.NotifyingDriver
 	// 时填入；未填时唤醒契约测试跳过。
 	Notifier glock.NotifyingDriver
+	// Sem 承载信号量能力（可选）：Driver 实现 glock.SemaphoreDriver 时填入；
+	// 未填时信号量契约测试跳过。
+	Sem glock.SemaphoreLocker
 }
 
 // Factory 为每个子测试构造隔离环境（ns 为该子测试唯一的命名空间）。
@@ -78,6 +81,13 @@ func RunSuite(t *testing.T, f Factory) {
 	run("MultiAllOrNothing", testMultiAllOrNothing)
 	run("MultiSharedWatchdog", testMultiSharedWatchdog)
 	run("MultiNoCrossDeadlock", testMultiNoCrossDeadlock)
+	run("SemaphoreCapacity", testSemCapacity)
+	run("SemaphoreReentrantSlots", testSemReentrantSlots)
+	run("SemaphoreCapacityMismatch", testSemCapacityMismatch)
+	run("SemaphoreLeaseAutoRelease", testSemLeaseAutoRelease)
+	run("SemaphoreFencing", testSemFencing)
+	run("SemaphoreBlockingAndCtx", testSemBlockingAndCtx)
+	run("SemaphoreWatchdogLost", testSemWatchdogLost)
 	run("WatchdogLostSingle", testWatchdogLostSingle)
 	run("Probe", testProbe)
 	run("NotifyRelease", testNotifyRelease)

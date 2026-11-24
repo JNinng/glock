@@ -65,3 +65,24 @@ type NotifyingDriver interface {
 	// 返回 ctx 错误。
 	WaitForChange(ctx context.Context, key string, maxWait time.Duration) error
 }
+
+// SemaphoreDriver 是 Driver 的可选扩展：N 上限资源池（并发槽位、连接配额）。
+// 槽位即持有：租约、可重入、防误删、栅栏契约与锁完全一致——释放即腾出槽位，
+// 过期即自动腾出（获取路径惰性清理），重入（同 Owner 再取）多占一个槽位且
+// 沿用既有栅栏，只有全新持有者是获取事件、递增栅栏；同一 Owner 的全部槽位
+// 共享一份租约（与读模式的共享记录一致）。信号量记录的键空间与锁隔离：
+// 同名的锁与信号量互不相干。
+//
+// 实现约定：
+//
+//   - 容量在池首个获取时固定。记录尚有存活槽位时，容量声明与既有记录不符
+//     返回 ErrCapacityMismatch（不可等待自愈）；全部槽位过期清空后允许重新
+//     声明（记录消失即容量消失，与锁的过期接管同构）。
+//   - BasicLocker 以 Mode.Semaphore 调用继承的 Refresh/Release 操作信号量
+//     记录：实现 SemaphoreDriver 即必须让这两个方法按 Mode 路由。
+type SemaphoreDriver interface {
+	// TryAcquireSemaphore 尝试获取一个槽位（n 为容量上限）。
+	// 返回 (fence, nil) 表示成功；存活槽位已满返回 (0, ErrHeld)；
+	// 容量声明与既有记录不符返回 (0, ErrCapacityMismatch)。
+	TryAcquireSemaphore(ctx context.Context, key string, n int, owner string, lease time.Duration) (uint64, error)
+}

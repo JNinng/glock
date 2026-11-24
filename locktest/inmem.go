@@ -15,6 +15,7 @@ import (
 type InmemDriver struct {
 	mu      sync.Mutex
 	recs    map[string]*inmemRec
+	sems    map[string]*inmemSem // 信号量记录：键空间与锁隔离
 	counter uint64
 
 	changed map[string]chan struct{} // 每键唤醒广播：变更时关闭并重置
@@ -27,6 +28,13 @@ type inmemRec struct {
 	readers map[string]*inmemHold
 }
 
+// inmemSem 是一个信号量池：cap 在首个获取时固定，holders 为 Owner → 槽位
+// 计数与租约（同 Owner 的全部槽位共享一份租约）。
+type inmemSem struct {
+	cap     int
+	holders map[string]*inmemHold
+}
+
 type inmemHold struct {
 	count   int
 	fence   uint64
@@ -35,11 +43,12 @@ type inmemHold struct {
 
 // NewInmemDriver 构造内存 Driver。
 func NewInmemDriver() *InmemDriver {
-	return &InmemDriver{recs: map[string]*inmemRec{}, changed: map[string]chan struct{}{}}
+	return &InmemDriver{recs: map[string]*inmemRec{}, sems: map[string]*inmemSem{}, changed: map[string]chan struct{}{}}
 }
 
 // broadcast 关闭 key 的唤醒通道（须持 d.mu 调用）。对齐真实后端：只在
-// 记录删除（释放归零）与降级时广播，TryAcquire/Refresh 不广播。
+// 放行性变更（记录删除、降级、信号量槽位腾出）时广播，TryAcquire/Refresh
+// 不广播。
 func (d *InmemDriver) broadcast(key string) {
 	if ch, ok := d.changed[key]; ok {
 		close(ch)
@@ -159,11 +168,88 @@ func (d *InmemDriver) holdOf(r *inmemRec, mode glock.Mode, owner string) *inmemH
 	return r.writer
 }
 
-// Refresh 实现 glock.Driver。
+// semLiveOf 取信号量池中 owner 的存活槽位记录，无效返回 nil。
+func (d *InmemDriver) semLiveOf(r *inmemSem, owner string, fence uint64, now time.Time) *inmemHold {
+	if !d.semLive(r, now) {
+		return nil
+	}
+	h := r.holders[owner]
+	if h == nil || h.fence != fence || !h.expires.After(now) {
+		return nil
+	}
+	return h
+}
+
+// TryAcquireSemaphore 实现 glock.SemaphoreDriver。容量在池首个获取时固定；
+// 存活槽位已满返回 ErrHeld（重入同样受容量约束），容量声明不符返回
+// ErrCapacityMismatch；全部槽位过期清空后允许重新声明。
+func (d *InmemDriver) TryAcquireSemaphore(_ context.Context, key string, n int, owner string, lease time.Duration) (uint64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	r := d.sems[key]
+	if r != nil {
+		d.semPurge(r, now)
+	}
+	if d.semLive(r, now) {
+		if r.cap != n {
+			return 0, fmt.Errorf("inmem: %w", glock.ErrCapacityMismatch)
+		}
+		inUse := 0
+		for _, h := range r.holders {
+			inUse += h.count
+		}
+		if inUse >= n {
+			return 0, fmt.Errorf("inmem: %w", glock.ErrHeld)
+		}
+		if h, ok := r.holders[owner]; ok {
+			h.count++
+			h.expires = now.Add(lease)
+			return h.fence, nil // 重入多占槽位，沿用代际
+		}
+	} else {
+		// 全新池（记录不存在或槽位全部过期）：容量在此固定。
+		r = &inmemSem{cap: n, holders: map[string]*inmemHold{}}
+		d.sems[key] = r
+	}
+	d.counter++
+	r.holders[owner] = &inmemHold{count: 1, fence: d.counter, expires: now.Add(lease)}
+	return d.counter, nil
+}
+
+func (d *InmemDriver) semLive(r *inmemSem, now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	for _, h := range r.holders {
+		if h.expires.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *InmemDriver) semPurge(r *inmemSem, now time.Time) {
+	for o, h := range r.holders {
+		if !h.expires.After(now) {
+			delete(r.holders, o)
+		}
+	}
+}
+
+// Refresh 实现 glock.Driver：信号量槽位（Mode.Semaphore）路由到信号量记录。
 func (d *InmemDriver) Refresh(_ context.Context, key string, mode glock.Mode, owner string, fence uint64, lease time.Duration) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
+	if mode == glock.Semaphore {
+		r := d.sems[key]
+		if d.semLiveOf(r, owner, fence, now) == nil {
+			return fmt.Errorf("inmem: %w", glock.ErrNotOwner)
+		}
+		r.holders[owner].expires = now.Add(lease)
+		return nil
+	}
 	r := d.recs[key]
 	if r == nil || r.mode != mode || !d.live(r, now) {
 		return fmt.Errorf("inmem: %w", glock.ErrNotOwner)
@@ -176,11 +262,27 @@ func (d *InmemDriver) Refresh(_ context.Context, key string, mode glock.Mode, ow
 	return nil
 }
 
-// Release 实现 glock.Driver。
+// Release 实现 glock.Driver：信号量槽位释放即腾出（广播唤醒等待者）。
 func (d *InmemDriver) Release(_ context.Context, key string, mode glock.Mode, owner string, fence uint64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
+	if mode == glock.Semaphore {
+		r := d.sems[key]
+		if d.semLiveOf(r, owner, fence, now) == nil {
+			return fmt.Errorf("inmem: %w", glock.ErrNotOwner)
+		}
+		h := r.holders[owner]
+		h.count--
+		d.broadcast(key) // 槽位腾出：唤醒等待者（记录是否删净都广播）
+		if h.count <= 0 {
+			delete(r.holders, owner)
+			if len(r.holders) == 0 {
+				delete(d.sems, key)
+			}
+		}
+		return nil
+	}
 	r := d.recs[key]
 	if r == nil || r.mode != mode || !d.live(r, now) {
 		return fmt.Errorf("inmem: %w", glock.ErrNotOwner)
@@ -225,11 +327,12 @@ func (d *InmemDriver) Downgrade(_ context.Context, key, owner string, fence uint
 	return nil
 }
 
-// Drop 删除记录，模拟后端数据消失。
+// Drop 删除记录（锁与信号量键空间一并），模拟后端数据消失。
 func (d *InmemDriver) Drop(_ context.Context, key string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.recs, key)
+	delete(d.sems, key)
 	d.broadcast(key)
 	return nil
 }

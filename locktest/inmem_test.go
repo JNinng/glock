@@ -20,6 +20,7 @@ func TestInmemConformance(t *testing.T) {
 			Saboteur: &inmemSaboteur{drv: drv, ns: ns},
 			Prober:   locker,
 			Notifier: drv,
+			Sem:      locker,
 		}
 	})
 }

@@ -64,6 +64,7 @@ var demos = []demo{
 	{"写降读", demoDowngrade},
 	{"可重入与 WAL 恢复", demoReentrant},
 	{"多锁全有或全无", demoMultiLock},
+	{"信号量容量与释放", demoSemaphore},
 	{"WithLock 执行辅助", demoWithLock},
 	{"Probe 状态内省", demoProbe},
 	{"Locker 级默认配置", demoDefaults},
@@ -72,6 +73,7 @@ var demos = []demo{
 	{"计数器对撞", demoCounterCollision},
 	{"交叉多锁无死锁", demoCrossMultiLock},
 	{"多读者对撞", demoReadersCollision},
+	{"信号量槽位对撞", demoSemaphoreSlotsCollision},
 	{"watchdog 压力竞争", demoWatchdogPressure},
 	{"同 token 并发重入", demoReentrantCollision},
 	{"阻塞等待过期接管", demoBlockingExpiryWake},
@@ -351,6 +353,116 @@ func demoMultiLock(ctx context.Context, _ env, lg glock.Locker) error {
 	return wantErr("句柄已终结，二次释放被拒", func() error {
 		return ml.Release(ctx)
 	}(), glock.ErrLost)
+}
+
+func demoSemaphore(ctx context.Context, _ env, lg glock.Locker) error {
+	sem, ok := lg.(glock.SemaphoreLocker)
+	if !ok {
+		return errors.New("Locker 不提供信号量（SemaphoreLocker）")
+	}
+	s1, err := sem.TryAcquireSemaphore(ctx, "sem", 2, glock.WithOwner("a"), glock.WithLease(30*time.Second))
+	if err := wantOK("槽位一 TryAcquireSemaphore", err); err != nil {
+		return err
+	}
+	s2, err := sem.TryAcquireSemaphore(ctx, "sem", 2, glock.WithOwner("b"))
+	if err := wantOK("槽位二进入", err); err != nil {
+		return err
+	}
+	if err := wantErr("槽位满员他人被拒", func() error {
+		_, err := sem.TryAcquireSemaphore(ctx, "sem", 2, glock.WithOwner("c"))
+		return err
+	}(), glock.ErrHeld); err != nil {
+		return err
+	}
+	if err := wantErr("容量声明不符被拒（不可等待自愈）", func() error {
+		_, err := sem.TryAcquireSemaphore(ctx, "sem", 3, glock.WithOwner("d"))
+		return err
+	}(), glock.ErrCapacityMismatch); err != nil {
+		return err
+	}
+	if err := wantOK("释放槽位二", s2.Release(ctx)); err != nil {
+		return err
+	}
+	s3, err := sem.TryAcquireSemaphore(ctx, "sem", 2, glock.WithOwner("c"))
+	if err := wantOK("腾出槽位后他人进入", err); err != nil {
+		return err
+	}
+	for _, s := range []struct {
+		name string
+		h    *glock.SemaphoreLock
+	}{{"槽位一", s1}, {"槽位三", s3}} {
+		if err := wantOK("清理 "+s.name, s.h.Release(ctx)); err != nil {
+			return err
+		}
+	}
+	// 全部腾出后重入语义自检：同 token 两取共占两槽、栅栏不变。
+	token := glock.NewOwnerToken()
+	r1, err := sem.TryAcquireSemaphore(ctx, "sem", 2, glock.WithOwner(token))
+	if err := wantOK("同 token 首取", err); err != nil {
+		return err
+	}
+	r2, err := sem.TryAcquireSemaphore(ctx, "sem", 2, glock.WithOwner(token))
+	if err := wantOK("同 token 重入（多占一槽）", err); err != nil {
+		return err
+	}
+	if r1.FencingToken() != r2.FencingToken() {
+		return fmt.Errorf("重入不应递增栅栏: %d vs %d", r1.FencingToken(), r2.FencingToken())
+	}
+	if err := wantErr("两槽占满后他人被拒", func() error {
+		_, err := sem.TryAcquireSemaphore(ctx, "sem", 2, glock.WithOwner("e"))
+		return err
+	}(), glock.ErrHeld); err != nil {
+		return err
+	}
+	if err := wantOK("清理重入一", r1.Release(ctx)); err != nil {
+		return err
+	}
+	return wantOK("清理重入二", r2.Release(ctx))
+}
+
+func demoSemaphoreSlotsCollision(ctx context.Context, _ env, lg glock.Locker) error {
+	sem, ok := lg.(glock.SemaphoreLocker)
+	if !ok {
+		return errors.New("Locker 不提供信号量（SemaphoreLocker）")
+	}
+	const slots = 4
+	handles := make([]*glock.SemaphoreLock, collideN)
+	errs := runCollide(collideN, func(i int) error {
+		h, err := sem.TryAcquireSemaphore(ctx, "cc-sem", slots,
+			glock.WithOwner(fmt.Sprintf("s-%d", i)), glock.WithLease(30*time.Second))
+		if err == nil {
+			handles[i] = h
+		}
+		return err
+	})
+	wins, held := 0, 0
+	var winners []*glock.SemaphoreLock
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			wins++
+			winners = append(winners, handles[i])
+		case errors.Is(err, glock.ErrHeld):
+			held++
+		default:
+			return fmt.Errorf("竞争者 %d: 意外错误 %v", i, err)
+		}
+	}
+	if wins != slots || held != collideN-slots {
+		return fmt.Errorf("%d 并发抢 %d 槽: 赢家=%d ErrHeld=%d; want %d/%d",
+			collideN, slots, wins, held, slots, collideN-slots)
+	}
+	for i, s := range winners {
+		if err := wantOK(fmt.Sprintf("清理赢家槽位 %d", i), s.Release(ctx)); err != nil {
+			return err
+		}
+	}
+	// 全部腾出后容量可复用。
+	again, err := sem.TryAcquireSemaphore(ctx, "cc-sem", slots, glock.WithOwner("late"))
+	if err := wantOK("全部腾出后可再取", err); err != nil {
+		return err
+	}
+	return wantOK("清理", again.Release(ctx))
 }
 
 func demoWithLock(ctx context.Context, _ env, lg glock.Locker) error {

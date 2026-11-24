@@ -7,19 +7,23 @@
 //   - 写模式字段：owner、count、mode="0"、fence、expires（绝对毫秒时间戳）。
 //   - 读模式字段：mode="1"，每个读者三件套 o:<owner>（计数）、e:<owner>（到期）、
 //     f:<owner>（栅栏）。
+//   - 信号量记录：独立 Hash "<prefix>{<key>}:s"（键空间与锁隔离，同 slot），
+//     mode="2" + cap（容量上限）+ 每个持有者 o:/e:/f:<owner> 三件套（与读模式
+//     同构，同 Owner 的多个槽位共享一份计数与租约）；栅栏计数与锁共用。
 //   - 栅栏计数：独立 Key "<prefix>{<key>}:f" 的 INCR，永不过期（保单调）。
-//   - 释放唤醒通道：<prefix>{<key>}:n。释放使记录删除、或写降读时由 Go 侧
-//     PUBLISH "release"；WaitForChange 订阅该通道供阻塞获取提前醒来。不用
-//     keyspace notifications：它需要服务端 CONFIG SET（默认关闭且影响整个
-//     实例）；发布是尽力而为的，订阅生效前的释放会漏收，轮询间隔是等待上限。
+//   - 释放唤醒通道：<prefix>{<key>}:n。释放使记录删除/槽位腾出、或写降读时
+//     由 Go 侧 PUBLISH "release"；WaitForChange 订阅该通道供阻塞获取提前醒来。
+//     不用 keyspace notifications：它需要服务端 CONFIG SET（默认关闭且影响
+//     整个实例）；发布是尽力而为的，订阅生效前的释放会漏收，轮询间隔是等待上限。
 //
-// 默认布局示例：锁 glock:{job:42}，栅栏 glock:{job:42}:f，唤醒通道 glock:{job:42}:n。
+// 默认布局示例：锁 glock:{job:42}，信号量 glock:{job:42}:s，栅栏 glock:{job:42}:f，
+// 唤醒通道 glock:{job:42}:n。
 //
 // 所有操作走 Lua 保证原子。过期比较用客户端绝对时间：竞争者间的时钟偏差
 // 进入互斥窗口，要求运行环境 NTP 对时（Redisson 同款假设）。
 // 记录 Key 额外设置 PEXPIRE = 2×租约，让无人接管的过期记录由服务端回收。
-// 读模式下该 TTL 只延长不缩短（共享记录属于全体读者，短租约读者的操作
-// 不得压短长租约读者的存活窗口），代价是读者全部离开后记录至多滞留
+// 读模式与信号量下该 TTL 只延长不缩短（共享记录属于全体持有者，短租约者
+// 的操作不得压短长租约者的存活窗口），代价是持有者全部离开后记录至多滞留
 // 最长租约的 2 倍才被回收。
 package redisc
 
@@ -62,6 +66,13 @@ type Driver struct {
 	prefix string
 }
 
+var (
+	_ glock.Driver          = (*Driver)(nil)
+	_ glock.SemaphoreDriver = (*Driver)(nil)
+	_ glock.ProbingDriver   = (*Driver)(nil)
+	_ glock.NotifyingDriver = (*Driver)(nil)
+)
+
 // NewDriver 构造 Driver。通常直接用 New 获得完整 Locker。
 func NewDriver(client redis.UniversalClient, opts ...DriverOption) *Driver {
 	c := driverConfig{prefix: DefaultKeyPrefix}
@@ -72,13 +83,15 @@ func NewDriver(client redis.UniversalClient, opts ...DriverOption) *Driver {
 }
 
 // Lua 返回码约定（acquire 返回数组，首元素为码，成功附栅栏；其余脚本返回单整数）：
-// 1 成功，2 成功且记录已删除（用于发布唤醒信号），0 被他人持有，-1 防误删拒绝，-2 模式冲突。
+// 1 成功，2 成功且记录已删除/槽位已腾出（用于发布唤醒信号），0 被他人持有或
+// 槽位已满，-1 防误删拒绝，-2 模式冲突，-3 容量声明不符。
 const (
-	retOK       = 1
-	retReleased = 2
-	retHeld     = 0
-	retNotOwner = -1
-	retConflict = -2
+	retOK          = 1
+	retReleased    = 2
+	retHeld        = 0
+	retNotOwner    = -1
+	retConflict    = -2
+	retCapMismatch = -3
 )
 
 var acquireScript = redis.NewScript(`
@@ -240,6 +253,90 @@ end
 return -1
 `)
 
+// 信号量获取：记录与锁键空间隔离（独立 Hash），字段为 mode='2' + cap +
+// 每持有者 o:/e:/f: 三件套。惰性清理过期持有后判定：存活槽位已满返回 0
+// （重入同样受容量约束）；容量声明不符返回 -3；重入多占一个槽位、沿用
+// 既有栅栏；全新持有者 INCR 栅栏（与锁共用计数器，跨资源仍单调）。池
+// 清空（全部槽位过期）后容量可重新声明。返回 {码} 或 {码, 栅栏}。
+var semAcquireScript = redis.NewScript(`
+local lock, fkey = KEYS[1], KEYS[2]
+local owner, now, lease, cap = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+
+local m = redis.call('HGET', lock, 'mode')
+if m then
+  local fields = redis.call('HGETALL', lock)
+  local del = {}
+  local inUse = 0
+  for i = 1, #fields, 2 do
+    local f = fields[i]
+    if string.sub(f, 1, 2) == 'e:' then
+      local o = string.sub(f, 3)
+      if tonumber(fields[i + 1]) > now then
+        inUse = inUse + tonumber(redis.call('HGET', lock, 'o:' .. o))
+      else
+        del[#del + 1] = 'o:' .. o
+        del[#del + 1] = 'e:' .. o
+        del[#del + 1] = 'f:' .. o
+      end
+    end
+  end
+  if #del > 0 then redis.call('HDEL', lock, unpack(del)) end
+  if inUse > 0 then
+    if tonumber(redis.call('HGET', lock, 'cap')) ~= cap then return {-3} end
+    if inUse >= cap then return {0} end
+    if redis.call('HEXISTS', lock, 'o:' .. owner) == 1 then
+      redis.call('HINCRBY', lock, 'o:' .. owner, 1)
+      redis.call('HSET', lock, 'e:' .. owner, now + lease)
+      local ttl = redis.call('PTTL', lock)
+      if ttl < lease * 2 then redis.call('PEXPIRE', lock, lease * 2) end
+      return {1, tonumber(redis.call('HGET', lock, 'f:' .. owner))}
+    end
+  else
+    redis.call('HSET', lock, 'cap', cap)
+  end
+  local f = redis.call('INCR', fkey)
+  redis.call('HSET', lock, 'o:' .. owner, 1)
+  redis.call('HSET', lock, 'e:' .. owner, now + lease)
+  redis.call('HSET', lock, 'f:' .. owner, f)
+  local ttl = redis.call('PTTL', lock)
+  if ttl < lease * 2 then redis.call('PEXPIRE', lock, lease * 2) end
+  return {1, f}
+end
+
+local f = redis.call('INCR', fkey)
+redis.call('HSET', lock, 'mode', '2')
+redis.call('HSET', lock, 'cap', cap)
+redis.call('HSET', lock, 'o:' .. owner, 1)
+redis.call('HSET', lock, 'e:' .. owner, now + lease)
+redis.call('HSET', lock, 'f:' .. owner, f)
+redis.call('PEXPIRE', lock, lease * 2)
+return {1, f}
+`)
+
+// 信号量释放：校验通过即腾出一个槽位并返回 2（无论记录是否删净都发布
+// 唤醒信号——每个槽位腾出都放行等待者）。持有者走空时删除记录。
+var semReleaseScript = redis.NewScript(`
+local lock = KEYS[1]
+local owner, fence, now = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
+if redis.call('HGET', lock, 'mode') == '2' then
+  if tonumber(redis.call('HGET', lock, 'f:' .. owner)) == fence
+      and tonumber(redis.call('HGET', lock, 'e:' .. owner)) > now then
+    local c = redis.call('HINCRBY', lock, 'o:' .. owner, -1)
+    if c <= 0 then
+      redis.call('HDEL', lock, 'o:' .. owner, 'e:' .. owner, 'f:' .. owner)
+    end
+    local fields = redis.call('HKEYS', lock)
+    local holders = 0
+    for i = 1, #fields do
+      if string.sub(fields[i], 1, 2) == 'o:' then holders = holders + 1 end
+    end
+    if holders == 0 then redis.call('DEL', lock) end
+    return 2
+  end
+end
+return -1
+`)
+
 // Probe 只读内省：绝不改动记录（脚本无 DEL/HDEL/HSET/PEXPIRE）。只列存活
 // 持有（expires > now），剩余租约按记录内的绝对到期时间与客户端 now 之差
 // 计算，与获取/续约的存活判定同源；服务端 PEXPIRE 的回收残余（已过期未
@@ -280,7 +377,10 @@ return out
 // lockKey 返回锁记录的物理键：<prefix>{<key>}。
 func (d *Driver) lockKey(key string) string { return d.prefix + "{" + key + "}" }
 
-// fenceKey 返回栅栏计数的物理键：<prefix>{<key>}:f（与锁记录同 slot）。
+// semKey 返回信号量记录的物理键：<prefix>{<key>}:s（键空间与锁隔离，同 slot）。
+func (d *Driver) semKey(key string) string { return d.prefix + "{" + key + "}:s" }
+
+// fenceKey 返回栅栏计数的物理键：<prefix>{<key>}:f（与锁/信号量记录同 slot）。
 func (d *Driver) fenceKey(key string) string { return d.prefix + "{" + key + "}:f" }
 
 // notifyKey 返回释放唤醒的发布通道：<prefix>{<key>}:n（与锁记录同 slot；
@@ -299,10 +399,27 @@ func (d *Driver) TryAcquire(ctx context.Context, key string, mode glock.Mode, ow
 	return acquireResult(key, res)
 }
 
-// Refresh 实现 glock.Driver。
+// TryAcquireSemaphore 实现 glock.SemaphoreDriver。
+func (d *Driver) TryAcquireSemaphore(ctx context.Context, key string, n int, owner string, lease time.Duration) (uint64, error) {
+	res, err := semAcquireScript.Run(ctx, d.client,
+		[]string{d.semKey(key), d.fenceKey(key)},
+		owner, time.Now().UnixMilli(), lease.Milliseconds(), n,
+	).Slice()
+	if err != nil {
+		return 0, fmt.Errorf("redisc: acquire semaphore %q: %w", key, err)
+	}
+	return acquireResult(key, res)
+}
+
+// Refresh 实现 glock.Driver：信号量槽位（Mode.Semaphore）路由到信号量记录，
+// 续约脚本对两者同构（读模式分支按 o:/e:/f: 三件套校验并延长）。
 func (d *Driver) Refresh(ctx context.Context, key string, mode glock.Mode, owner string, fence uint64, lease time.Duration) error {
+	recKey := d.lockKey(key)
+	if mode == glock.Semaphore {
+		recKey = d.semKey(key)
+	}
 	n, err := refreshScript.Run(ctx, d.client,
-		[]string{d.lockKey(key)},
+		[]string{recKey},
 		owner, fence, time.Now().UnixMilli(), lease.Milliseconds(), modeArg(mode),
 	).Int()
 	if err != nil {
@@ -311,8 +428,22 @@ func (d *Driver) Refresh(ctx context.Context, key string, mode glock.Mode, owner
 	return intResult(key, n)
 }
 
-// Release 实现 glock.Driver。
+// Release 实现 glock.Driver：信号量槽位路由到信号量释放脚本（每个腾出的
+// 槽位都发布唤醒信号）。
 func (d *Driver) Release(ctx context.Context, key string, mode glock.Mode, owner string, fence uint64) error {
+	if mode == glock.Semaphore {
+		n, err := semReleaseScript.Run(ctx, d.client,
+			[]string{d.semKey(key)},
+			owner, fence, time.Now().UnixMilli(),
+		).Int()
+		if err != nil {
+			return fmt.Errorf("redisc: release %q: %w", key, err)
+		}
+		if n == retReleased {
+			_ = d.client.Publish(ctx, d.notifyKey(key), "release").Err()
+		}
+		return intResult(key, n)
+	}
 	n, err := releaseScript.Run(ctx, d.client,
 		[]string{d.lockKey(key)},
 		owner, fence, time.Now().UnixMilli(), modeArg(mode),
@@ -413,9 +544,9 @@ func waitOut(ctx context.Context, deadline time.Time) error {
 	}
 }
 
-// Drop 删除锁记录（不删栅栏计数），仅供测试模拟后端数据消失。
+// Drop 删除锁与信号量记录（不删栅栏计数），仅供测试模拟后端数据消失。
 func (d *Driver) Drop(ctx context.Context, key string) error {
-	if err := d.client.Del(ctx, d.lockKey(key)).Err(); err != nil {
+	if err := d.client.Del(ctx, d.lockKey(key), d.semKey(key)).Err(); err != nil {
 		return fmt.Errorf("redisc: drop %q: %w", key, err)
 	}
 	return nil
@@ -424,6 +555,9 @@ func (d *Driver) Drop(ctx context.Context, key string) error {
 func modeArg(mode glock.Mode) string {
 	if mode == glock.Read {
 		return "1"
+	}
+	if mode == glock.Semaphore {
+		return "2"
 	}
 	return "0"
 }
@@ -458,6 +592,8 @@ func acquireResult(key string, res []interface{}) (uint64, error) {
 		return 0, fmt.Errorf("redisc: acquire %q: %w", key, glock.ErrHeld)
 	case retConflict:
 		return 0, fmt.Errorf("redisc: acquire %q: %w", key, glock.ErrModeConflict)
+	case retCapMismatch:
+		return 0, fmt.Errorf("redisc: acquire %q: %w", key, glock.ErrCapacityMismatch)
 	default:
 		return 0, fmt.Errorf("redisc: acquire %q: unexpected code %d", key, code)
 	}

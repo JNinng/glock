@@ -41,6 +41,20 @@ type MultiLocker interface {
 	AcquireAll(ctx context.Context, keys []string, opts ...AcquireOption) (*MultiLock, error)
 }
 
+// SemaphoreLocker 声明信号量能力（N 上限资源池）。每个槽位是一次持有：
+// 有界租约、可重入、防误删、Fencing Token 与锁一致。Driver 实现
+// SemaphoreDriver 时 BasicLocker 自动具备，否则运行时返回 ErrUnsupported。
+type SemaphoreLocker interface {
+	Locker
+	// TryAcquireSemaphore 非阻塞获取一个槽位（n 为容量上限，容量在池首个
+	// 获取时固定）：槽位已满立即返回 ErrHeld；容量声明与既有记录不符返回
+	// ErrCapacityMismatch。
+	TryAcquireSemaphore(ctx context.Context, key string, n int, opts ...AcquireOption) (*SemaphoreLock, error)
+	// AcquireSemaphore 阻塞获取一个槽位：直到成功或 ctx 结束。ctx 结束仍未
+	// 获得时返回同时包装 ErrHeld 与 ctx 错误的错误。重试与唤醒编排同 Acquire。
+	AcquireSemaphore(ctx context.Context, key string, n int, opts ...AcquireOption) (*SemaphoreLock, error)
+}
+
 // BasicLocker 基于 Driver 提供全部编排，实现 Locker、RWLocker、MultiLocker。
 // 后端模块用它对外暴露统一的 Locker 类型。
 type BasicLocker struct {
@@ -107,7 +121,10 @@ func (l *BasicLocker) tryAcquire(ctx context.Context, key string, mode Mode, opt
 	if err != nil {
 		return nil, err
 	}
-	h, err := l.acquireOne(ctx, key, mode, cfg, blocking)
+	try := func(ctx context.Context, fullKey, owner string, lease time.Duration) (uint64, error) {
+		return l.drv.TryAcquire(ctx, fullKey, mode, owner, lease)
+	}
+	h, err := l.acquireOne(ctx, key, mode, cfg, blocking, try)
 	if err != nil {
 		return nil, err
 	}
@@ -117,13 +134,44 @@ func (l *BasicLocker) tryAcquire(ctx context.Context, key string, mode Mode, opt
 	return h, nil
 }
 
+// trySemaphore 完成信号量槽位获取：容量校验与能力探测（缺失返回
+// ErrUnsupported）后，槽位走与锁相同的获取循环与 watchdog 编排。
+func (l *BasicLocker) trySemaphore(ctx context.Context, key string, n int, opts []AcquireOption, blocking bool) (*hold, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("glock: semaphore capacity must be positive, got %d", n)
+	}
+	sd, ok := l.drv.(SemaphoreDriver)
+	if !ok {
+		return nil, fmt.Errorf("glock: acquire semaphore %q: %w", key, ErrUnsupported)
+	}
+	cfg, err := l.newAcquireConfig(opts)
+	if err != nil {
+		return nil, err
+	}
+	try := func(ctx context.Context, fullKey, owner string, lease time.Duration) (uint64, error) {
+		return sd.TryAcquireSemaphore(ctx, fullKey, n, owner, lease)
+	}
+	h, err := l.acquireOne(ctx, key, Semaphore, cfg, blocking, try)
+	if err != nil {
+		return nil, err
+	}
+	if h.wdOn {
+		startWatchdog([]*hold{h})
+	}
+	return h, nil
+}
+
+// acquireTry 抽象一次获取尝试：锁走 Driver.TryAcquire，信号量走
+// SemaphoreDriver.TryAcquireSemaphore（n 闭包绑定）。编排循环共用。
+type acquireTry func(ctx context.Context, fullKey, owner string, lease time.Duration) (uint64, error)
+
 // acquireOne 执行单 Key 获取循环，不启动 watchdog（多锁路径由整组统一启动）。
-func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg acquireConfig, blocking bool) (*hold, error) {
+func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg acquireConfig, blocking bool, try acquireTry) (*hold, error) {
 	fullKey := l.prefix + key
 	nd, wake := l.drv.(NotifyingDriver)
 	start := time.Now()
 	for {
-		fence, err := l.drv.TryAcquire(ctx, fullKey, mode, cfg.owner, cfg.lease)
+		fence, err := try(ctx, fullKey, cfg.owner, cfg.lease)
 		if err == nil {
 			l.met.acquired.Add(ctx, 1)
 			l.met.acqDur.Record(ctx, time.Since(start).Seconds())
@@ -167,6 +215,22 @@ func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg
 	}
 }
 
+func (l *BasicLocker) TryAcquireSemaphore(ctx context.Context, key string, n int, opts ...AcquireOption) (*SemaphoreLock, error) {
+	h, err := l.trySemaphore(ctx, key, n, opts, false)
+	if err != nil {
+		return nil, err
+	}
+	return &SemaphoreLock{h: h}, nil
+}
+
+func (l *BasicLocker) AcquireSemaphore(ctx context.Context, key string, n int, opts ...AcquireOption) (*SemaphoreLock, error) {
+	h, err := l.trySemaphore(ctx, key, n, opts, true)
+	if err != nil {
+		return nil, err
+	}
+	return &SemaphoreLock{h: h}, nil
+}
+
 func (l *BasicLocker) TryAcquireAll(ctx context.Context, keys []string, opts ...AcquireOption) (*MultiLock, error) {
 	return l.acquireAll(ctx, keys, opts, false)
 }
@@ -185,8 +249,11 @@ func (l *BasicLocker) acquireAll(ctx context.Context, keys []string, opts []Acqu
 	}
 	sorted := sortedUnique(keys)
 	holds := make([]*hold, 0, len(sorted))
+	try := func(ctx context.Context, fullKey, owner string, lease time.Duration) (uint64, error) {
+		return l.drv.TryAcquire(ctx, fullKey, Write, owner, lease)
+	}
 	for _, k := range sorted {
-		h, err := l.acquireOne(ctx, k, Write, cfg, blocking)
+		h, err := l.acquireOne(ctx, k, Write, cfg, blocking, try)
 		if err != nil {
 			// 回滚已获取的（逆序），让竞争者看到全有或全无。
 			for i := len(holds) - 1; i >= 0; i-- {

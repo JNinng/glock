@@ -458,6 +458,277 @@ func testMultiNoCrossDeadlock(t *testing.T, env Env) {
 	}
 }
 
+// ---- 信号量（Env.Sem 可选）：槽位即持有，租约/重入/防误删/栅栏与锁一致 ----
+
+func testSemCapacity(t *testing.T, env Env) {
+	if env.Sem == nil {
+		t.Skip("Env 未提供 Sem：Driver 未实现 glock.SemaphoreDriver")
+	}
+	ctx := context.Background()
+	s1, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("a"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("b"))
+	if err != nil {
+		t.Fatalf("second slot: %v", err)
+	}
+	if _, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("c")); !errors.Is(err, glock.ErrHeld) {
+		t.Fatalf("full pool want ErrHeld, got %v", err)
+	}
+	// 重入也占槽位：满员时既有持有者再取同样被拒。
+	if _, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("a")); !errors.Is(err, glock.ErrHeld) {
+		t.Fatalf("reentrant at full pool want ErrHeld, got %v", err)
+	}
+	if err := s2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s3, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("c"))
+	if err != nil {
+		t.Fatalf("slot freed by release: %v", err)
+	}
+	if err := s1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s3.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 全部释放后再取（容量一致）：池可复用。
+	s4, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("d"))
+	if err != nil {
+		t.Fatalf("acquire after pool emptied: %v", err)
+	}
+	if err := s4.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testSemReentrantSlots(t *testing.T, env Env) {
+	if env.Sem == nil {
+		t.Skip("Env 未提供 Sem：Driver 未实现 glock.SemaphoreDriver")
+	}
+	ctx := context.Background()
+	s1, err := env.Sem.AcquireSemaphore(ctx, "sk", 2, glock.WithOwner("me"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := env.Sem.AcquireSemaphore(ctx, "sk", 2, glock.WithOwner("me"))
+	if err != nil {
+		t.Fatalf("reentrant slot: %v", err)
+	}
+	if s1.FencingToken() != s2.FencingToken() {
+		t.Fatalf("reentrant fence changed: %d vs %d", s1.FencingToken(), s2.FencingToken())
+	}
+	if _, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("other")); !errors.Is(err, glock.ErrHeld) {
+		t.Fatalf("2/2 slots used, want ErrHeld, got %v", err)
+	}
+	// 释放一层后有空槽：other 进入占满；me 释放最后一层后持有条目消失，
+	// 再取是全新获取事件，栅栏递增。
+	if err := s1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	o1, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("other"))
+	if err != nil {
+		t.Fatalf("other should take freed slot: %v", err)
+	}
+	if err := s2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s3, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("me"))
+	if err != nil {
+		t.Fatalf("re-acquire after holder drained: %v", err)
+	}
+	if s3.FencingToken() <= s1.FencingToken() {
+		t.Fatalf("fresh acquisition fence %d should exceed stale %d", s3.FencingToken(), s1.FencingToken())
+	}
+	if err := o1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s3.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testSemCapacityMismatch(t *testing.T, env Env) {
+	if env.Sem == nil {
+		t.Skip("Env 未提供 Sem：Driver 未实现 glock.SemaphoreDriver")
+	}
+	ctx := context.Background()
+	s, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("me"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 3, glock.WithOwner("other")); !errors.Is(err, glock.ErrCapacityMismatch) {
+		t.Fatalf("want ErrCapacityMismatch, got %v", err)
+	}
+	// 同一声明不受影响；阻塞获取对容量不符也立即失败（不可等待自愈）。
+	o, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("other"))
+	if err != nil {
+		t.Fatalf("same declaration must still work, got %v", err)
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := env.Sem.AcquireSemaphore(ctx2, "sk", 3, glock.WithOwner("third")); !errors.Is(err, glock.ErrCapacityMismatch) {
+		t.Fatalf("blocking mismatch want ErrCapacityMismatch, got %v", err)
+	}
+	if err := o.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 全部槽位过期清空后：容量可重新声明。
+	s2, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 2, glock.WithOwner("me"), glock.WithLease(leaseFast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(holdForDag)
+	s3, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 5, glock.WithOwner("me"))
+	if err != nil {
+		t.Fatalf("re-declare after pool emptied: %v", err)
+	}
+	if err := s3.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Release(ctx); !errors.Is(err, glock.ErrLost) {
+		t.Fatalf("expired slot release want ErrLost, got %v", err)
+	}
+}
+
+func testSemLeaseAutoRelease(t *testing.T, env Env) {
+	if env.Sem == nil {
+		t.Skip("Env 未提供 Sem：Driver 未实现 glock.SemaphoreDriver")
+	}
+	ctx := context.Background()
+	s, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 1, glock.WithOwner("me"), glock.WithLease(leaseFast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(holdForDag)
+	// 槽位随租约过期自动腾出（容量 1：他人可接管）。
+	w, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 1, glock.WithOwner("other"))
+	if err != nil {
+		t.Fatalf("expired slot should auto-release: %v", err)
+	}
+	// 过期句柄的释放被拒绝（防误删：不能删别人的槽位记录）。
+	if err := s.Release(ctx); !errors.Is(err, glock.ErrLost) || !errors.Is(err, glock.ErrNotOwner) {
+		t.Fatalf("stale release want ErrLost+ErrNotOwner, got %v", err)
+	}
+	if err := w.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testSemFencing(t *testing.T, env Env) {
+	if env.Sem == nil {
+		t.Skip("Env 未提供 Sem：Driver 未实现 glock.SemaphoreDriver")
+	}
+	ctx := context.Background()
+	// 全新持有者是获取事件：栅栏严格递增；重入沿用栅栏（留一空槽给重入）。
+	var prev uint64
+	handles := make([]*glock.SemaphoreLock, 0, 3)
+	for _, owner := range []string{"a", "b", "c"} {
+		s, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 4, glock.WithOwner(owner), glock.WithLease(leaseLong))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.FencingToken() <= prev {
+			t.Fatalf("fence %d not increasing (prev %d)", s.FencingToken(), prev)
+		}
+		prev = s.FencingToken()
+		handles = append(handles, s)
+	}
+	a2, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 4, glock.WithOwner("a"))
+	if err != nil {
+		t.Fatalf("reentrant slot: %v", err)
+	}
+	if a2.FencingToken() != handles[0].FencingToken() {
+		t.Fatalf("reentrant fence mismatch: %d vs %d", a2.FencingToken(), handles[0].FencingToken())
+	}
+	for _, s := range handles {
+		if err := s.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testSemBlockingAndCtx(t *testing.T, env Env) {
+	if env.Sem == nil {
+		t.Skip("Env 未提供 Sem：Driver 未实现 glock.SemaphoreDriver")
+	}
+	ctx := context.Background()
+	// 阻塞获取：槽位腾出后在时限内拿到（Driver 实现 NotifyingDriver 时靠信号，
+	// 否则靠轮询——同一断言都应通过）。
+	h, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 1, glock.WithOwner("holder"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		s, err := env.Sem.AcquireSemaphore(ctx, "sk", 1, glock.WithOwner("waiter"), glock.WithRetryInterval(retryFast))
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- s.Release(ctx)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking semaphore acquire did not finish after release")
+	}
+
+	// ctx 结束：返回同时包装 ErrHeld 与 ctx 错误。
+	if _, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 1, glock.WithOwner("holder"), glock.WithLease(leaseLong)); err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 120*time.Millisecond)
+	defer cancel()
+	_, err = env.Sem.AcquireSemaphore(ctx2, "sk", 1, glock.WithOwner("waiter"), glock.WithRetryInterval(20*time.Millisecond))
+	if !errors.Is(err, glock.ErrHeld) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want ErrHeld+DeadlineExceeded, got %v", err)
+	}
+}
+
+func testSemWatchdogLost(t *testing.T, env Env) {
+	if env.Sem == nil {
+		t.Skip("Env 未提供 Sem：Driver 未实现 glock.SemaphoreDriver")
+	}
+	ctx := context.Background()
+	s, err := env.Sem.AcquireSemaphore(ctx, "sk", 1, glock.WithOwner("me"), glock.WithLease(leaseFast), glock.WithWatchdog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(holdForDag) // 越过原始租约：保活只能靠 watchdog
+	if _, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 1, glock.WithOwner("other")); !errors.Is(err, glock.ErrHeld) {
+		t.Fatalf("watchdog should keep slot, got %v", err)
+	}
+	if err := env.Saboteur.Drop("sk"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-s.Lost():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Lost not closed after watchdog refresh failed")
+	}
+	if err := s.Release(ctx); !errors.Is(err, glock.ErrLost) {
+		t.Fatalf("release after lost want ErrLost, got %v", err)
+	}
+	if _, err := env.Sem.TryAcquireSemaphore(ctx, "sk", 1, glock.WithOwner("other"), glock.WithLease(leaseFast)); err != nil {
+		t.Fatalf("after loss other owner should acquire freely: %v", err)
+	}
+}
+
 func testWatchdogLostSingle(t *testing.T, env Env) {
 	ctx := context.Background()
 	h, err := env.Locker.Acquire(ctx, "k", glock.WithOwner("me"), glock.WithLease(leaseFast), glock.WithWatchdog())
