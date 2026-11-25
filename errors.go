@@ -5,9 +5,15 @@ import "errors"
 var (
 	// ErrHeld 表示资源不可用：互斥锁被其他持有者持有（租约存活），或信号量
 	// 的存活槽位已满。TryAcquire/TryAcquireSemaphore 竞争失败时立即返回；
-	// Acquire/AcquireSemaphore 阻塞到 ctx 结束仍未获得时，返回同时包装
-	// ErrHeld 与 ctx 错误的错误。
+	// Acquire/AcquireSemaphore 阻塞后放弃时（ctx 结束，或 WithMaxRetries 重试
+	// 上限用尽）返回同时包装 ErrHeld 与放弃原因（ctx 错误或 ErrExhausted）
+	// 的错误。
 	ErrHeld = errors.New("glock: key held by another owner")
+
+	// ErrExhausted 表示阻塞获取因 WithMaxRetries 重试上限用尽而放弃：ctx
+	// 之外的显式放弃路径，与 ctx 放弃路径（ErrHeld+ctx 错误）互斥。含义是
+	// "整个等待期间资源始终被他人持有，且重试预算已用尽"。
+	ErrExhausted = errors.New("glock: retries exhausted")
 
 	// ErrLost 表示本地持有已终结——丢失（租约到期或续期失败）、已释放或
 	// 已降级转移——句柄不再背书互斥。

@@ -66,6 +66,8 @@ func RunSuite(t *testing.T, f Factory) {
 	run("Mutex", testMutex)
 	run("AcquireBlockingRetries", testAcquireBlockingRetries)
 	run("AcquireCtxDoneWrapsErrHeld", testAcquireCtxDone)
+	run("AcquireMaxRetriesExhausts", testAcquireMaxRetries)
+	run("AcquireBackoff", testAcquireBackoff)
 	run("LeaseAutoRelease", testLeaseAutoRelease)
 	run("FencingMonotonic", testFencingMonotonic)
 	run("SafeReleaseStaleFence", testSafeReleaseStaleFence)

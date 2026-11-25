@@ -104,6 +104,86 @@ func testAcquireCtxDone(t *testing.T, env Env) {
 	}
 }
 
+func testAcquireMaxRetries(t *testing.T, env Env) {
+	ctx := context.Background()
+	h, err := env.Locker.TryAcquire(ctx, "mr", glock.WithOwner("holder"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 上限用尽：ErrHeld+ErrExhausted，放弃不等 ctx，迅速返回。
+	start := time.Now()
+	_, err = env.Locker.Acquire(ctx, "mr", glock.WithOwner("waiter"),
+		glock.WithRetryInterval(retryFast), glock.WithMaxRetries(2))
+	if !errors.Is(err, glock.ErrHeld) || !errors.Is(err, glock.ErrExhausted) {
+		t.Fatalf("want ErrHeld+ErrExhausted, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("exhaustion must give up promptly, took %s", elapsed)
+	}
+	// n=0 即单次尝试（TryAcquire 语义），不进入等待路径。
+	start = time.Now()
+	_, err = env.Locker.Acquire(ctx, "mr", glock.WithOwner("waiter"), glock.WithMaxRetries(0))
+	if !errors.Is(err, glock.ErrHeld) || !errors.Is(err, glock.ErrExhausted) {
+		t.Fatalf("n=0 want ErrHeld+ErrExhausted, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("n=0 must not enter the wait path, took %s", elapsed)
+	}
+	// 上限内锁释放：照常拿到（上限只加放弃路径，不改获取语义）。
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		if err := h.Release(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	h2, err := env.Locker.Acquire(ctx, "mr", glock.WithOwner("waiter"),
+		glock.WithRetryInterval(retryFast), glock.WithMaxRetries(20))
+	if err != nil {
+		t.Fatalf("acquire within retry limit: %v", err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testAcquireBackoff(t *testing.T, env Env) {
+	ctx := context.Background()
+	// 封顶低于初始间隔：获取时校验报错。
+	h0, err := env.Locker.TryAcquire(ctx, "bk", glock.WithBackoff(50*time.Millisecond, 20*time.Millisecond))
+	if err == nil {
+		h0.Release(ctx)
+		t.Fatal("backoff cap below initial must be rejected")
+	}
+	// 退避等待下照常拿到（活性）：持有 250ms 后释放，等待者以 10ms→80ms
+	// 退避逐轮重试，须在释放后的等待窗口内成功。
+	h, err := env.Locker.TryAcquire(ctx, "bk", glock.WithOwner("holder"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired := make(chan error, 1)
+	go func() {
+		h2, err := env.Locker.Acquire(context.Background(), "bk",
+			glock.WithOwner("waiter"), glock.WithBackoff(10*time.Millisecond, 80*time.Millisecond), glock.WithMaxRetries(100))
+		if err != nil {
+			acquired <- err
+			return
+		}
+		acquired <- h2.Release(context.Background())
+	}()
+	time.Sleep(250 * time.Millisecond)
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-acquired:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("backoff acquire did not finish after release")
+	}
+}
+
 func testLeaseAutoRelease(t *testing.T, env Env) {
 	ctx := context.Background()
 	h, err := env.Locker.Acquire(ctx, "k", glock.WithOwner("me"), glock.WithLease(leaseFast))

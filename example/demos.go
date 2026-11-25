@@ -79,6 +79,7 @@ var backendDemos = []backendDemo{
 var demos = []demo{
 	{"互斥与 ErrHeld", demoMutex},
 	{"阻塞获取与释放唤醒", demoBlockingWake},
+	{"等待策略：退避与重试上限", demoWaitingStrategy},
 	{"固定租约与防误删", demoLease},
 	{"watchdog 自动续期", demoWatchdog},
 	{"读写锁与模式冲突", demoReadWrite},
@@ -168,6 +169,31 @@ func demoBlockingWake(ctx context.Context, _ env, lg glock.Locker) error {
 	case <-time.After(5 * time.Second):
 		return errors.New("waiter 5s 内未醒来：释放唤醒未生效（10s 轮询不可能在时限内触发）")
 	}
+}
+
+func demoWaitingStrategy(ctx context.Context, _ env, lg glock.Locker) error {
+	// 重试上限是 ctx 之外的显式放弃路径：2 次重试用尽即返回，错误同时包装
+	// ErrHeld 与 ErrExhausted（与 ctx 取消路径互斥）。
+	holder, err := lg.TryAcquire(ctx, "waitpol", glock.WithOwner("holder"), glock.WithLease(30*time.Second))
+	if err := wantOK("holder TryAcquire", err); err != nil {
+		return err
+	}
+	_, aerr := lg.Acquire(ctx, "waitpol", glock.WithOwner("waiter"),
+		glock.WithBackoff(20*time.Millisecond, 80*time.Millisecond), glock.WithMaxRetries(2))
+	if !errors.Is(aerr, glock.ErrHeld) || !errors.Is(aerr, glock.ErrExhausted) {
+		return fmt.Errorf("重试上限用尽应同时包装 ErrHeld 与 ErrExhausted, got %v", aerr)
+	}
+	// 上限内释放：指数退避等待照常拿到（上限只加放弃路径，不改获取语义）。
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		holder.Release(context.Background())
+	}()
+	h, err := lg.Acquire(ctx, "waitpol", glock.WithOwner("waiter"),
+		glock.WithBackoff(20*time.Millisecond, 80*time.Millisecond), glock.WithMaxRetries(50))
+	if err := wantOK("退避等待方在上限内拿到锁", err); err != nil {
+		return err
+	}
+	return wantOK("清理", h.Release(ctx))
 }
 
 func demoLease(ctx context.Context, _ env, lg glock.Locker) error {

@@ -18,6 +18,7 @@ type fakeDriver struct {
 	counter uint64
 	refresh int // Refresh 成功次数
 
+	tries   map[string][]time.Time   // 每键 TryAcquire 时间戳（等待策略断言用）
 	changed map[string]chan struct{} // 每键唤醒广播：变更时关闭并重置
 	waiting atomic.Int64             // 正在 WaitForChange 中停靠的等待者数（测试用）
 }
@@ -43,7 +44,15 @@ type fakeHoldRec struct {
 }
 
 func newFakeDriver() *fakeDriver {
-	return &fakeDriver{recs: map[string]*fakeRec{}, sems: map[string]*fakeSem{}, changed: map[string]chan struct{}{}}
+	return &fakeDriver{recs: map[string]*fakeRec{}, sems: map[string]*fakeSem{},
+		tries: map[string][]time.Time{}, changed: map[string]chan struct{}{}}
+}
+
+// tryTimes 返回 key 的全部 TryAcquire 时间戳（等待策略断言用）。
+func (d *fakeDriver) tryTimes(key string) []time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]time.Time(nil), d.tries[key]...)
 }
 
 func (d *fakeDriver) live(r *fakeRec, now time.Time) bool {
@@ -79,6 +88,7 @@ func (d *fakeDriver) TryAcquire(_ context.Context, key string, mode Mode, owner 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
+	d.tries[key] = append(d.tries[key], now)
 	r := d.recs[key]
 	if r != nil {
 		d.purge(r, now)

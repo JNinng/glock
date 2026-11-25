@@ -27,12 +27,14 @@ type acquireConfig struct {
 	owner      string
 	lease      time.Duration
 	watchdog   bool
-	retryEvery time.Duration
+	retryEvery time.Duration // 固定策略的间隔；退避策略的初始间隔
+	backoffCap time.Duration // >0 启用指数退避：失败后 ×2 增长、封顶于此
+	maxRetries int           // 初次失败后最多重试次数；负数不限
 }
 
 // newAcquireConfig 以 Locker 级默认值打底，再应用单次获取选项。
 func (l *BasicLocker) newAcquireConfig(opts []AcquireOption) (acquireConfig, error) {
-	c := acquireConfig{lease: l.defLease, watchdog: l.defWatchdog, retryEvery: DefaultRetryInterval}
+	c := acquireConfig{lease: l.defLease, watchdog: l.defWatchdog, retryEvery: DefaultRetryInterval, maxRetries: -1}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -42,10 +44,33 @@ func (l *BasicLocker) newAcquireConfig(opts []AcquireOption) (acquireConfig, err
 	if c.retryEvery <= 0 {
 		return c, fmt.Errorf("glock: retry interval must be positive, got %s", c.retryEvery)
 	}
+	if c.backoffCap > 0 && c.backoffCap < c.retryEvery {
+		return c, fmt.Errorf("glock: backoff cap %s must not be below initial interval %s", c.backoffCap, c.retryEvery)
+	}
 	if c.owner == "" {
 		c.owner = NewOwnerToken()
 	}
 	return c, nil
+}
+
+// waitAt 计算第 round 轮失败的等待时长（round 从 1 计）。固定策略恒为
+// retryEvery；指数退避（WithBackoff）从 retryEvery 起 ×2 增长、封顶
+// backoffCap。两者都带 ±20% 抖动，防同频惊群。
+func (c acquireConfig) waitAt(round int) time.Duration {
+	d := c.retryEvery
+	if c.backoffCap > 0 {
+		for i := 1; i < round && d < c.backoffCap; i++ {
+			if d > c.backoffCap/2 {
+				d = c.backoffCap // 再翻倍即达上限（同时防溢出）
+				break
+			}
+			d *= 2
+		}
+		if d > c.backoffCap {
+			d = c.backoffCap
+		}
+	}
+	return jitter(d)
 }
 
 // WithOwner 指定 Owner Token（持有者身份），默认自动生成。
@@ -67,9 +92,26 @@ func WithWatchdog() AcquireOption {
 	return func(c *acquireConfig) { c.watchdog = true }
 }
 
-// WithRetryInterval 设置阻塞获取的轮询间隔，默认 200ms（±20% 抖动）。
+// WithRetryInterval 设置阻塞获取的轮询间隔（固定策略），默认 200ms
+// （±20% 抖动）。与 WithBackoff 互斥：后声明者生效。
 func WithRetryInterval(d time.Duration) AcquireOption {
-	return func(c *acquireConfig) { c.retryEvery = d }
+	return func(c *acquireConfig) { c.retryEvery = d; c.backoffCap = 0 }
+}
+
+// WithBackoff 用指数退避替换固定轮询间隔：首次失败等 initial，此后每轮
+// ×2 增长、封顶 max（均 ±20% 抖动），长竞争下压低无效轮询频率。作用于
+// 全部阻塞获取。与 WithRetryInterval 互斥：后声明者生效；max 低于
+// initial 在获取时校验报错。
+func WithBackoff(initial, max time.Duration) AcquireOption {
+	return func(c *acquireConfig) { c.retryEvery = initial; c.backoffCap = max }
+}
+
+// WithMaxRetries 限制阻塞获取的尝试次数：初次失败后最多再重试 n 次（总
+// 尝试 n+1 次），用尽即放弃并返回同时包装 ErrHeld 与 ErrExhausted 的错误
+// （放弃前不再等待）。这是 ctx 之外的显式放弃路径；负数表示不限（默认），
+// n=0 即单次尝试（等价 TryAcquire 的尝试语义）。作用于全部阻塞获取。
+func WithMaxRetries(n int) AcquireOption {
+	return func(c *acquireConfig) { c.maxRetries = n }
 }
 
 // Option 配置 Locker 构造。

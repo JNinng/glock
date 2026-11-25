@@ -15,10 +15,12 @@ type Locker interface {
 	// TryAcquire 非阻塞获取：一次尝试，竞争失败立即返回 ErrHeld。
 	TryAcquire(ctx context.Context, key string, opts ...AcquireOption) (*Lock, error)
 
-	// Acquire 阻塞获取：直到成功或 ctx 结束。ctx 结束仍未获得时返回
-	// 同时包装 ErrHeld 与 ctx 错误的错误。不保证公平与获得顺序。
-	// Driver 实现 NotifyingDriver 时由释放信号唤醒，否则按间隔轮询；
-	// 轮询间隔（WithRetryInterval）是任一实现的等待时长上限。
+	// Acquire 阻塞获取：直到成功、ctx 结束或重试上限（WithMaxRetries）用尽。
+	// ctx 结束仍未获得时返回同时包装 ErrHeld 与 ctx 错误的错误；重试上限
+	// 用尽返回同时包装 ErrHeld 与 ErrExhausted 的错误。不保证公平与获得
+	// 顺序。Driver 实现 NotifyingDriver 时由释放信号唤醒，否则按间隔轮询；
+	// 轮询间隔（WithRetryInterval 固定或 WithBackoff 退避）是任一实现的
+	// 等待时长上限。
 	Acquire(ctx context.Context, key string, opts ...AcquireOption) (*Lock, error)
 }
 
@@ -50,8 +52,10 @@ type SemaphoreLocker interface {
 	// 获取时固定）：槽位已满立即返回 ErrHeld；容量声明与既有记录不符返回
 	// ErrCapacityMismatch。
 	TryAcquireSemaphore(ctx context.Context, key string, n int, opts ...AcquireOption) (*SemaphoreLock, error)
-	// AcquireSemaphore 阻塞获取一个槽位：直到成功或 ctx 结束。ctx 结束仍未
-	// 获得时返回同时包装 ErrHeld 与 ctx 错误的错误。重试与唤醒编排同 Acquire。
+	// AcquireSemaphore 阻塞获取一个槽位：直到成功、ctx 结束或重试上限
+	// （WithMaxRetries）用尽。放弃契约同 Acquire：ctx 结束返回包装
+	// ErrHeld+ctx 错误的错误，上限用尽返回包装 ErrHeld+ErrExhausted 的
+	// 错误。重试与唤醒编排同 Acquire。
 	AcquireSemaphore(ctx context.Context, key string, n int, opts ...AcquireOption) (*SemaphoreLock, error)
 }
 
@@ -170,6 +174,7 @@ func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg
 	fullKey := l.prefix + key
 	nd, wake := l.drv.(NotifyingDriver)
 	start := time.Now()
+	failures := 0 // 已失败尝试数：初次获取 + WithMaxRetries 次重试
 	for {
 		fence, err := try(ctx, fullKey, cfg.owner, cfg.lease)
 		if err == nil {
@@ -195,10 +200,18 @@ func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg
 			l.met.held.Add(ctx, 1)
 			return nil, err
 		}
+		failures++
+		// 重试上限（WithMaxRetries）：ctx 之外的显式放弃路径，放弃契约与
+		// ctx 路径同构——同时包装 ErrHeld 与放弃原因，放弃前不再等待。
+		if cfg.maxRetries >= 0 && failures > cfg.maxRetries {
+			l.met.held.Add(ctx, 1)
+			return nil, fmt.Errorf("%w: %w", ErrHeld, ErrExhausted)
+		}
+		wait := cfg.waitAt(failures)
 		// 释放唤醒（NotifyingDriver 可选）：信号优先，轮询兜底。信号是尽力
 		// 而为的——漏收、多收、虚假唤醒都无害，任何返回后都重走 TryAcquire。
 		if wake {
-			if werr := nd.WaitForChange(ctx, fullKey, jitter(cfg.retryEvery)); werr == nil {
+			if werr := nd.WaitForChange(ctx, fullKey, wait); werr == nil {
 				continue
 			} else if ctx.Err() != nil {
 				l.met.held.Add(ctx, 1)
@@ -210,7 +223,7 @@ func (l *BasicLocker) acquireOne(ctx context.Context, key string, mode Mode, cfg
 		case <-ctx.Done():
 			l.met.held.Add(ctx, 1)
 			return nil, fmt.Errorf("%w: %w", ErrHeld, ctx.Err())
-		case <-time.After(jitter(cfg.retryEvery)):
+		case <-time.After(wait):
 		}
 	}
 }
