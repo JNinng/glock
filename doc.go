@@ -13,6 +13,9 @@
 //   - 读→写升级不提供；持写再取读返回 ErrModeConflict，写持有者应使用 Downgrade。
 //   - 信号量（N 上限资源池）是 Driver 可选能力：槽位即持有，租约、重入、
 //     防误删、栅栏与锁一致；容量随池首个获取固定。
+//   - 选主（Leadership）是核心编排（LeaderElector）：Campaign 当选后失位自动
+//     再竞选，只终结于 Resign 与 ctx；租约式选主存在双主窗口，下游正确性
+//     仍由栅栏防护兜底。
 //
 // 后端实现 Driver（单次原子操作），用 NewBasicLocker 获得全部编排
 // （阻塞重试、watchdog、句柄生命周期、多锁回滚）。

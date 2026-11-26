@@ -71,6 +71,7 @@ go locker.RunReaper(ctx, time.Minute)
 | 写降读    | `Lock.Downgrade(ctx)`（原子、栅栏不变、需写计数=1、旧句柄终结）                                                                                 |
 | 多锁     | `AcquireAll`（仅互斥、字典序防死锁、all-or-nothing 回滚）                                                                                  |
 | 信号量   | `AcquireSemaphore / TryAcquireSemaphore(ctx, key, n)`：N 上限槽位池，每槽一份租约与栅栏；容量随首个获取固定（不符返回 `ErrCapacityMismatch`），槽满返回 `ErrHeld`；Driver 实现 `SemaphoreDriver` 即具备，否则返回 `ErrUnsupported` |
+| 选主   | `Campaign(ctx, key)`（`LeaderElector`，BasicLocker 恒定实现）：阻塞当选（放弃契约同 `Acquire`），失位（接管/过期/续期失败）自动再竞选，`OnLost`/`OnRegained` 同步有序回调、`Resign` 退位、`Done` 终结；watchdog 强制开启，再竞选不受 `WithMaxRetries` 约束；租约式选主有双主窗口，下游正确性仍靠栅栏防护 |
 | 下游栅栏防护 | `redisc.FencedSet / FencedGet`（栅栏 CAS：接受 ≥、拒绝 <，拒绝返回 false）；`postgrec.FencedUpsertSQL`（条件更新构造器：影响 0 行即拒绝）。语义见 ADR-0007 |
 | 执行辅助   | `WithLock(ctx, key, fn)`：阻塞获取→fn→自动释放；watchdog 发现丢失时取消 fn 的 ctx（cause=ErrLost），丢失/释放失败并入返回值 |
 | 状态内省   | `Probe(ctx, key)`：只读列出存活持有（Owner、模式、剩余租约、Fence），按 Owner 排序；Driver 实现 `ProbingDriver` 即具备，否则返回 `ErrUnsupported` |

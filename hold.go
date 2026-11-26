@@ -67,6 +67,7 @@ type hold struct {
 
 	lost     chan struct{}
 	lostOnce sync.Once
+	lostErr  error       // 丢失原因：lostOnce 内先存后关，观察到 Lost 关闭即可读
 	dead     atomic.Bool // 已 Release 或已降级转移，本地持有终结
 	wd       *watchdog   // 由 startWatchdog 设置；nil 表示无后台续约
 }
@@ -104,6 +105,7 @@ func (h *hold) closeLost() { h.lostOnce.Do(func() { close(h.lost) }) }
 // markLost 标记持有丢失：关闭 Lost、记一次日志与指标。
 func (h *hold) markLost(ctx context.Context, reason error) {
 	h.lostOnce.Do(func() {
+		h.lostErr = reason
 		close(h.lost)
 		h.met.lost.Add(ctx, 1)
 		h.log.WarnContext(ctx, "glock: hold lost",
@@ -113,6 +115,10 @@ func (h *hold) markLost(ctx context.Context, reason error) {
 			slog.String(attrErrorType, reason.Error()))
 	})
 }
+
+// lostReason 返回丢失原因；仅在 Lost 已关闭后调用——关闭与赋值同在 lostOnce
+// 内，观察者收到关闭信号后读取必有值（通道关闭是同步点）。
+func (h *hold) lostReason() error { return h.lostErr }
 
 // ended 报告持有是否已终结；已终结返回包装 ErrLost 的错误，仍有效返回 nil。
 func (h *hold) ended() error {

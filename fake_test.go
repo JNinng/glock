@@ -21,6 +21,8 @@ type fakeDriver struct {
 	tries   map[string][]time.Time   // 每键 TryAcquire 时间戳（等待策略断言用）
 	changed map[string]chan struct{} // 每键唤醒广播：变更时关闭并重置
 	waiting atomic.Int64             // 正在 WaitForChange 中停靠的等待者数（测试用）
+
+	nextRefreshErr error // 单次续期故障注入（选主/丢失路径测试用），消耗即清空
 }
 
 type fakeRec struct {
@@ -218,6 +220,10 @@ func (d *fakeDriver) semPurge(r *fakeSem, now time.Time) {
 func (d *fakeDriver) Refresh(_ context.Context, key string, mode Mode, owner string, fence uint64, lease time.Duration) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := d.nextRefreshErr; err != nil {
+		d.nextRefreshErr = nil
+		return err
+	}
 	now := time.Now()
 	if mode == Semaphore {
 		r := d.sems[key]
@@ -335,6 +341,13 @@ func (d *fakeDriver) WaitForChange(ctx context.Context, key string, maxWait time
 	case <-ch:
 		return nil
 	}
+}
+
+// failNextRefresh 注入一次续期失败（模拟传输故障），消耗即清空。
+func (d *fakeDriver) failNextRefresh(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.nextRefreshErr = err
 }
 
 // drop 删除记录（锁与信号量键空间一并），模拟后端数据消失（watchdog 丢失路径）。

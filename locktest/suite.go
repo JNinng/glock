@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -971,5 +972,202 @@ func testNotifyRelease(t *testing.T, env Env) {
 	}
 	if time.Since(start) > 3*time.Second {
 		t.Fatalf("ctx done must return promptly, took %s", time.Since(start))
+	}
+}
+
+// ---- 选主（Locker 上的 LeaderElector 能力）：跨任期句柄、失位自动再竞选、
+// 退位干净终结。编排属核心（BasicLocker 恒定实现）；Locker 未暴露该接口时
+// 跳过（非 BasicLocker 的第三方包装）。本地 Leading 视图在外部删记录后存在
+// 至多一个 watchdog 间隔的失位探测滞后（租约式选主固有，正确性由栅栏兜底），
+// 断言只针对滞后窗口收敛后的状态。
+
+func leaderElector(t *testing.T, env Env) glock.LeaderElector {
+	t.Helper()
+	le, ok := env.Locker.(glock.LeaderElector)
+	if !ok {
+		t.Skip("Locker 未提供 LeaderElector：非 *glock.BasicLocker 包装")
+	}
+	return le
+}
+
+// convergeLeadership 等过失位探测滞后窗口，断言两侧本地视图至多一个为 true。
+func convergeLeadership(t *testing.T, la, lb *glock.Leadership) {
+	t.Helper()
+	time.Sleep(2 * leaseFast) // ≥ 数倍 watchdog 间隔（leaseFast → 间隔 leaseFast/3）
+	if la.Leading() && lb != nil && lb.Leading() {
+		t.Fatal("leadership views did not converge after detection lag")
+	}
+}
+
+func testLeaderResignHandover(t *testing.T, env Env) {
+	le := leaderElector(t, env)
+	ctx := context.Background()
+
+	la, err := le.Campaign(ctx, "lk", glock.WithOwner("a"), glock.WithLease(leaseLong))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lostA := make(chan error, 4)
+	la.OnLost(func(reason error) { lostA <- reason })
+	fenceA := la.FencingToken()
+	if fenceA == 0 || !la.Leading() {
+		t.Fatalf("campaign must lead with fence, got fence=%d leading=%v", fenceA, la.Leading())
+	}
+
+	// 继任者被挡在 Campaign 外。
+	lbC := make(chan *glock.Leadership, 1)
+	go func() {
+		lb, err := le.Campaign(ctx, "lk", glock.WithOwner("b"), glock.WithLease(leaseLong), glock.WithRetryInterval(retryFast))
+		if err != nil {
+			t.Error(err)
+			close(lbC)
+			return
+		}
+		lbC <- lb
+	}()
+	time.Sleep(250 * time.Millisecond)
+	select {
+	case lb := <-lbC:
+		t.Fatalf("standby must block while leader holds: %v", lb)
+	default:
+	}
+
+	// 退位：继任者拿到全新栅栏；退位者是干净终结（无 OnLost，重复退位 ErrLost）。
+	if err := la.Resign(ctx); err != nil {
+		t.Fatalf("resign a: %v", err)
+	}
+	var lb *glock.Leadership
+	select {
+	case lb = <-lbC:
+	case <-time.After(5 * time.Second):
+		t.Fatal("standby did not take over after resign")
+	}
+	if !lb.Leading() || lb.FencingToken() <= fenceA {
+		t.Fatalf("new leader fence %d must exceed old %d", lb.FencingToken(), fenceA)
+	}
+	<-la.Done()
+	time.Sleep(100 * time.Millisecond)
+	if len(lostA) != 0 {
+		t.Fatal("resign must not fire OnLost")
+	}
+	if err := la.Resign(ctx); !errors.Is(err, glock.ErrLost) {
+		t.Fatalf("double resign want ErrLost, got %v", err)
+	}
+	if err := lb.Resign(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-lb.Done()
+}
+
+func testLeaderFailoverOnLoss(t *testing.T, env Env) {
+	le := leaderElector(t, env)
+	ctx := context.Background()
+
+	la, err := le.Campaign(ctx, "lk", glock.WithOwner("a"), glock.WithLease(leaseFast), glock.WithRetryInterval(300*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence0 := la.FencingToken()
+	lostA := make(chan error, 8)
+	regainedA := make(chan uint64, 8)
+	la.OnLost(func(reason error) { lostA <- reason })
+	la.OnRegained(func(fence uint64) { regainedA <- fence })
+
+	var lbObserved atomic.Pointer[glock.Leadership]
+	lbC := make(chan *glock.Leadership, 1)
+	go func() {
+		lb, err := le.Campaign(ctx, "lk", glock.WithOwner("b"), glock.WithLease(leaseFast), glock.WithRetryInterval(retryFast))
+		if err != nil {
+			t.Error(err)
+			close(lbC)
+			return
+		}
+		lbObserved.Store(lb)
+		lbC <- lb
+	}()
+
+	// 在任者失位：Saboteur 删记录 → watchdog 续期失败（ErrNotOwner）→ OnLost
+	// 带原因触发，自动再竞选。
+	if err := env.Saboteur.Drop("lk"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reason := <-lostA:
+		if !errors.Is(reason, glock.ErrNotOwner) {
+			t.Fatalf("OnLost reason want ErrNotOwner, got %v", reason)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnLost not fired after drop")
+	}
+
+	// 空位必被填补（a 再竞选与 b 竞选谁赢都行），删记录后的再获取都是全新
+	// 获取事件：新栅栏严格递增。
+	var leader *glock.Leadership
+	select {
+	case <-regainedA:
+		leader = la
+	case lb := <-lbC:
+		leader = lb
+	case <-time.After(5 * time.Second):
+		t.Fatal("no leader emerged after loss")
+	}
+	fence1 := leader.FencingToken()
+	if fence1 <= fence0 {
+		t.Fatalf("post-loss fence %d must exceed pre-loss %d (fresh acquisition)", fence1, fence0)
+	}
+	convergeLeadership(t, la, lbObserved.Load())
+
+	// 领导者退位：另一位当选，栅栏继续递增，视图收敛。
+	if err := leader.Resign(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var next *glock.Leadership
+	if leader == la {
+		select {
+		case next = <-lbC:
+		case <-time.After(5 * time.Second):
+			t.Fatal("standby did not take over after resign")
+		}
+	} else {
+		select {
+		case <-regainedA:
+			next = la
+		case <-time.After(5 * time.Second):
+			t.Fatal("deposed leader did not regain after resign")
+		}
+	}
+	if next.FencingToken() <= fence1 {
+		t.Fatalf("handover fence %d must exceed previous %d", next.FencingToken(), fence1)
+	}
+	convergeLeadership(t, la, lbObserved.Load())
+
+	if err := next.Resign(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-la.Done()
+	<-next.Done()
+}
+
+func testLeaderCampaignAbandon(t *testing.T, env Env) {
+	le := leaderElector(t, env)
+	ctx := context.Background()
+	if _, err := env.Locker.TryAcquire(ctx, "lk", glock.WithOwner("holder"), glock.WithLease(leaseLong)); err != nil {
+		t.Fatal(err)
+	}
+	// 重试上限用尽：ErrHeld+ErrExhausted，放弃不等 ctx。
+	start := time.Now()
+	_, err := le.Campaign(ctx, "lk", glock.WithOwner("a"), glock.WithRetryInterval(retryFast), glock.WithMaxRetries(2))
+	if !errors.Is(err, glock.ErrHeld) || !errors.Is(err, glock.ErrExhausted) {
+		t.Fatalf("want ErrHeld+ErrExhausted, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("exhaustion must give up promptly, took %s", elapsed)
+	}
+	// ctx 结束：ErrHeld+ctx 错误。
+	ctx2, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer cancel()
+	_, err = le.Campaign(ctx2, "lk", glock.WithOwner("a"), glock.WithRetryInterval(20*time.Millisecond))
+	if !errors.Is(err, glock.ErrHeld) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want ErrHeld+DeadlineExceeded, got %v", err)
 	}
 }

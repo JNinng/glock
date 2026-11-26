@@ -87,6 +87,7 @@ var demos = []demo{
 	{"可重入与 WAL 恢复", demoReentrant},
 	{"多锁全有或全无", demoMultiLock},
 	{"信号量容量与释放", demoSemaphore},
+	{"选主：竞选、退位与换届", demoLeaderElection},
 	{"WithLock 执行辅助", demoWithLock},
 	{"Probe 状态内省", demoProbe},
 	{"Locker 级默认配置", demoDefaults},
@@ -1126,4 +1127,84 @@ func demoFenceGuardPG(ctx context.Context, e env, lg glock.Locker) error {
 		return fmt.Errorf("拒绝后业务值 = %q, want v2", val)
 	}
 	return nil
+}
+
+// demoLeaderElection 验证选主编排（LeaderElector）：阻塞竞选互斥、退位干净
+// 换届（继任者全新栅栏、退位者不触发 OnLost）、首次当选放弃契约与 Acquire 同构。
+// 失位自动再竞选路径依赖后端故障注入（Saboteur），由 locktest 契约套件覆盖。
+func demoLeaderElection(ctx context.Context, _ env, lg glock.Locker) error {
+	le, ok := lg.(glock.LeaderElector)
+	if !ok {
+		return errors.New("Locker 不提供选主（LeaderElector）")
+	}
+	la, err := le.Campaign(ctx, "le", glock.WithOwner("a"), glock.WithLease(400*time.Millisecond), glock.WithRetryInterval(50*time.Millisecond))
+	if err := wantOK("a 竞选上任", err); err != nil {
+		return err
+	}
+	fenceA := la.FencingToken()
+	lostA := 0
+	la.OnLost(func(reason error) { lostA++ })
+
+	// b 竞选被挡在 Campaign 外（互斥）。
+	lbC := make(chan *glock.Leadership, 1)
+	go func() {
+		lb, err := le.Campaign(ctx, "le", glock.WithOwner("b"), glock.WithLease(400*time.Millisecond), glock.WithRetryInterval(50*time.Millisecond))
+		if err == nil {
+			lbC <- lb
+		}
+	}()
+	time.Sleep(250 * time.Millisecond)
+	select {
+	case <-lbC:
+		return errors.New("继任者不应在领导者退位前当选")
+	default:
+	}
+
+	// a 退位：干净终结——b 上位拿全新栅栏，a 无 OnLost。
+	if err := wantOK("a 退位", la.Resign(ctx)); err != nil {
+		return err
+	}
+	var lb *glock.Leadership
+	select {
+	case lb = <-lbC:
+	case <-time.After(5 * time.Second):
+		return errors.New("继任者未在退位后当选")
+	}
+	<-la.Done()
+	if lostA != 0 {
+		return errors.New("退位不得触发 OnLost")
+	}
+	if lb.FencingToken() <= fenceA {
+		return fmt.Errorf("换届栅栏 %d 应大于前任 %d", lb.FencingToken(), fenceA)
+	}
+	if err := wantOK("b 退位", lb.Resign(ctx)); err != nil {
+		return err
+	}
+	<-lb.Done()
+	probe, err := lg.TryAcquire(ctx, "le", glock.WithOwner("check"))
+	if err := wantOK("全部退位后锁可用", err); err != nil {
+		return err
+	}
+	if err := wantOK("清理", probe.Release(ctx)); err != nil {
+		return err
+	}
+
+	// 首次当选的放弃契约与 Acquire 同构：重试上限用尽 ErrHeld+ErrExhausted。
+	if _, err := lg.TryAcquire(ctx, "le", glock.WithOwner("holder"), glock.WithLease(30*time.Second)); err != nil {
+		return err
+	}
+	if err := wantErr("竞选被挡时上限用尽按 ErrExhausted 放弃", func() error {
+		_, err := le.Campaign(ctx, "le", glock.WithOwner("c"), glock.WithRetryInterval(20*time.Millisecond), glock.WithMaxRetries(2))
+		return err
+	}(), glock.ErrExhausted); err != nil {
+		return err
+	}
+	if _, err := lg.TryAcquire(ctx, "le", glock.WithOwner("check2")); !errors.Is(err, glock.ErrHeld) {
+		return errors.New("holder 持有应完好")
+	}
+	h, err := lg.TryAcquire(ctx, "le", glock.WithOwner("holder"))
+	if err != nil {
+		return err
+	}
+	return wantOK("清理 holder（重入释放）", h.Release(ctx))
 }

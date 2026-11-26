@@ -91,6 +91,9 @@ func RunSuite(t *testing.T, f Factory) {
 	run("SemaphoreBlockingAndCtx", testSemBlockingAndCtx)
 	run("SemaphoreWatchdogLost", testSemWatchdogLost)
 	run("WatchdogLostSingle", testWatchdogLostSingle)
+	run("LeaderResignHandover", testLeaderResignHandover)
+	run("LeaderFailoverOnLoss", testLeaderFailoverOnLoss)
+	run("LeaderCampaignAbandon", testLeaderCampaignAbandon)
 	run("Probe", testProbe)
 	run("NotifyRelease", testNotifyRelease)
 }
